@@ -1,0 +1,7 @@
+---
+source: crates/furcode_repo/src/agent.rs
+expression: "apply_subagent_tool_config(actual, &FurcodeConfig\n{ enable_subagents: true, ..Default::default() }).unwrap().tools"
+---
+- read
+- task
+- mcp_*

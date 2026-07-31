@@ -1,0 +1,75 @@
+[build]
+# Build the build script in the container to avoid GLIBC mismatch
+build-std = false
+default-target = "x86_64-unknown-linux-gnu"
+
+[build.env]
+passthrough = [
+    "APP_VERSION",
+    "POSTHOG_API_SECRET",
+]
+
+# Install modern protoc in all Cross containers
+# apt-get's protobuf-compiler is too old (proto2 only), so we download from GitHub.
+#
+# The default Ubuntu mirrors baked into cross images (archive.archive.ubuntu.com,
+# security.archive.ubuntu.com) are frequently unreachable from GitHub Actions
+# runners. Switch them to the Azure-hosted mirror (azure.archive.ubuntu.com),
+# which is co-located with GitHub's Linux runners and is reliable.
+[target.x86_64-unknown-linux-musl]
+image = "ghcr.io/cross-rs/x86_64-unknown-linux-musl:edge"
+pre-build = [
+    "sed -i 's|http://[a-z.]*archive.ubuntu.com|http://azure.archive.ubuntu.com|g; s|http://security.ubuntu.com|http://azure.archive.ubuntu.com|g' /etc/apt/sources.list /etc/apt/sources.list.d/*.list 2>/dev/null || true",
+    "apt-get update && apt-get install -y unzip",
+    "curl -LO https://github.com/protocolbuffers/protobuf/releases/download/v28.3/protoc-28.3-linux-x86_64.zip",
+    "unzip -o protoc-28.3-linux-x86_64.zip -d /usr/local bin/protoc",
+    "unzip -o protoc-28.3-linux-x86_64.zip -d /usr/local 'include/*'",
+    "chmod +x /usr/local/bin/protoc",
+]
+
+[target.aarch64-unknown-linux-musl]
+image = "ghcr.io/cross-rs/aarch64-unknown-linux-musl:edge"
+pre-build = [
+    "sed -i 's|http://[a-z.]*archive.ubuntu.com|http://azure.archive.ubuntu.com|g; s|http://security.ubuntu.com|http://azure.archive.ubuntu.com|g' /etc/apt/sources.list /etc/apt/sources.list.d/*.list 2>/dev/null || true",
+    "dpkg --add-architecture amd64",
+    "apt-get update && apt-get install -y unzip:amd64",
+    "curl -LO https://github.com/protocolbuffers/protobuf/releases/download/v28.3/protoc-28.3-linux-x86_64.zip",
+    "unzip -o protoc-28.3-linux-x86_64.zip -d /usr/local bin/protoc",
+    "unzip -o protoc-28.3-linux-x86_64.zip -d /usr/local 'include/*'",
+    "chmod +x /usr/local/bin/protoc",
+]
+
+[target.x86_64-unknown-linux-gnu]
+image = "ghcr.io/cross-rs/x86_64-unknown-linux-gnu:edge"
+pre-build = [
+    "sed -i 's|http://[a-z.]*archive.ubuntu.com|http://azure.archive.ubuntu.com|g; s|http://security.ubuntu.com|http://azure.archive.ubuntu.com|g' /etc/apt/sources.list /etc/apt/sources.list.d/*.list 2>/dev/null || true",
+    "apt-get update && apt-get install -y unzip",
+    "curl -LO https://github.com/protocolbuffers/protobuf/releases/download/v28.3/protoc-28.3-linux-x86_64.zip",
+    "unzip -o protoc-28.3-linux-x86_64.zip -d /usr/local bin/protoc",
+    "unzip -o protoc-28.3-linux-x86_64.zip -d /usr/local 'include/*'",
+    "chmod +x /usr/local/bin/protoc",
+]
+
+[target.aarch64-unknown-linux-gnu]
+image = "ghcr.io/cross-rs/aarch64-unknown-linux-gnu:edge"
+pre-build = [
+    "sed -i 's|http://[a-z.]*archive.ubuntu.com|http://azure.archive.ubuntu.com|g; s|http://security.ubuntu.com|http://azure.archive.ubuntu.com|g' /etc/apt/sources.list /etc/apt/sources.list.d/*.list 2>/dev/null || true",
+    "dpkg --add-architecture amd64",
+    "apt-get update && apt-get install -y unzip:amd64",
+    "curl -LO https://github.com/protocolbuffers/protobuf/releases/download/v28.3/protoc-28.3-linux-x86_64.zip",
+    "unzip -o protoc-28.3-linux-x86_64.zip -d /usr/local bin/protoc",
+    "unzip -o protoc-28.3-linux-x86_64.zip -d /usr/local 'include/*'",
+    "chmod +x /usr/local/bin/protoc",
+]
+
+[target.aarch64-linux-android]
+image = "ghcr.io/cross-rs/aarch64-linux-android:edge"
+pre-build = [
+    "sed -i 's|http://[a-z.]*archive.ubuntu.com|http://azure.archive.ubuntu.com|g; s|http://security.ubuntu.com|http://azure.archive.ubuntu.com|g' /etc/apt/sources.list /etc/apt/sources.list.d/*.list 2>/dev/null || true",
+    "dpkg --add-architecture amd64",
+    "apt-get update && apt-get install -y unzip:amd64",
+    "curl -LO https://github.com/protocolbuffers/protobuf/releases/download/v28.3/protoc-28.3-linux-x86_64.zip",
+    "unzip -o protoc-28.3-linux-x86_64.zip -d /usr/local bin/protoc",
+    "unzip -o protoc-28.3-linux-x86_64.zip -d /usr/local 'include/*'",
+    "chmod +x /usr/local/bin/protoc",
+]

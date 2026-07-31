@@ -1,0 +1,33 @@
+[package]
+name = "furcode_api"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+url.workspace = true
+async-trait.workspace = true
+furcode_domain.workspace = true
+furcode_stream.workspace = true
+furcode_services.workspace = true
+furcode_repo.workspace = true
+furcode_infra.workspace = true
+futures.workspace = true
+
+
+
+
+
+
+
+
+furcode_app.workspace = true
+serde_json.workspace = true
+furcode_config.workspace = true
+
+[dev-dependencies]
+
+tokio = { workspace = true }
+
+

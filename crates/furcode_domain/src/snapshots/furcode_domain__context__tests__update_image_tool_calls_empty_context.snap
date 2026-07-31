@@ -1,0 +1,5 @@
+---
+source: crates/furcode_domain/src/context.rs
+expression: actual
+---
+{}

@@ -1,0 +1,6 @@
+---
+source: crates/furcode_app/src/fmt/todo_fmt.rs
+expression: raw
+---
+
+  [31m󰄗 [9mWrite migrations[0m[0m

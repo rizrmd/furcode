@@ -1,0 +1,6 @@
+---
+source: crates/furcode_repo/src/agent.rs
+expression: actual.tools
+---
+- read
+- mcp_*

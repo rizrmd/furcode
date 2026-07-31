@@ -1,0 +1,1144 @@
+//! Ratatui drawing for [`super::view::TurnView`].
+//!
+//! Transcript memory model (important):
+//! - Source of truth is `TurnView.transcript` (raw strings only).
+//! - We **never** keep plain+rich copies of the entire history.
+//! - Only assistant rows near the viewport get an md-tui render, and far
+//!   rows are evicted so memory stays O(viewport), not O(history).
+
+use std::collections::HashMap;
+
+use ratatui::Frame;
+use ratatui::layout::{Constraint, Direction, Layout, Position, Rect};
+use ratatui::style::{Color, Modifier, Style};
+use ratatui::text::{Line, Span};
+use ratatui::widgets::Paragraph;
+
+use super::view::{ActivityPhase, HitRect, TranscriptKind, TranscriptLine, TurnView};
+
+const SPINNER: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+const JUMP_BOTTOM_LABEL: &str = " ↓ Jump to bottom ";
+/// Screen-lines of overscan for rich markdown.
+const RICH_OVERSCAN: usize = 16;
+/// Hard cap on richly-rendered assistant rows kept in memory.
+const MAX_RICH_ROWS: usize = 12;
+
+// ─── Lean cache ─────────────────────────────────────────────────────────────
+
+/// Rich render of one assistant transcript row.
+struct RichRow {
+    text_len: usize,
+    lines: Vec<Line<'static>>,
+}
+
+struct TranscriptCache {
+    revision: u64,
+    width: u16,
+    /// Estimated height per transcript index (cheap, no string storage).
+    heights: Vec<usize>,
+    /// Prefix sums of heights; len = heights.len() + 1.
+    offsets: Vec<usize>,
+    total_lines: usize,
+    /// Only near-viewport assistant rows: index → rich lines.
+    rich: HashMap<usize, RichRow>,
+    /// Last measured height for assistant rows (text_len, height). Survives
+    /// rich eviction so scrolling away from a tall reply does not collapse
+    /// total height and snap `scroll_offset` to the bottom while Working.
+    measured: HashMap<usize, (usize, usize)>,
+}
+
+impl TranscriptCache {
+    fn empty() -> Self {
+        Self {
+            revision: u64::MAX,
+            width: 0,
+            heights: Vec::new(),
+            offsets: Vec::new(),
+            total_lines: 0,
+            rich: HashMap::new(),
+            measured: HashMap::new(),
+        }
+    }
+
+    fn recompute_offsets(&mut self) {
+        self.offsets.clear();
+        self.offsets.reserve(self.heights.len() + 1);
+        let mut acc = 0usize;
+        self.offsets.push(0);
+        for &h in &self.heights {
+            acc += h.max(1);
+            self.offsets.push(acc);
+        }
+        self.total_lines = acc;
+    }
+}
+
+thread_local! {
+    static TRANSCRIPT_CACHE: std::cell::RefCell<TranscriptCache> =
+        std::cell::RefCell::new(TranscriptCache::empty());
+}
+
+// ─── Layout ─────────────────────────────────────────────────────────────────
+
+fn activity_row_count(view: &TurnView) -> u16 {
+    const MAX_PREVIEW: usize = 2;
+    if view.status_line.is_some() {
+        return 1;
+    }
+    match &view.activity {
+        ActivityPhase::Idle => u16::from(view.busy),
+        ActivityPhase::Thinking { buffer, .. } => {
+            1 + TurnView::last_preview_lines(buffer, MAX_PREVIEW).len() as u16
+        }
+        ActivityPhase::Tool { output, .. } => {
+            1 + TurnView::last_preview_lines(output, MAX_PREVIEW).len() as u16
+        }
+    }
+}
+
+pub fn draw(frame: &mut Frame, view: &mut TurnView, tick: u64) {
+    let area = frame.area();
+
+    // Double-Esc fork picker (user message history).
+    if view.fork_picker.is_some() {
+        draw_fork_picker(frame, area, view);
+        return;
+    }
+
+    // Full-screen transcript overlay (Ctrl+T).
+    if view.overlay.is_some() {
+        draw_overlay(frame, area, view);
+        return;
+    }
+
+    let activity_h = activity_row_count(view);
+    let pending_h = pending_row_count(view);
+    // Grow with soft-wrapped input; leave room for header/footer/activity.
+    let composer_h = composer_row_count(&view.composer.buffer, area.width);
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(1),                 // header
+            Constraint::Min(3),                    // scrollable transcript
+            Constraint::Length(pending_h),         // sticky queued prompts
+            Constraint::Length(activity_h),        // live activity
+            Constraint::Length(composer_h),        // multi-line composer
+            Constraint::Length(1),                 // footer
+        ])
+        .split(area);
+
+    draw_header(frame, chunks[0], view);
+    draw_transcript(frame, chunks[1], view);
+    if pending_h > 0 {
+        draw_pending(frame, chunks[2], view);
+    }
+    if activity_h > 0 {
+        draw_activity(frame, chunks[3], view, tick);
+    }
+    draw_composer(frame, chunks[4], view);
+    draw_footer(frame, chunks[5], view);
+}
+
+/// Max visual rows the composer may occupy (soft-wrap + explicit newlines).
+const COMPOSER_MAX_ROWS: u16 = 8;
+const COMPOSER_PREFIX_COLS: usize = 2; // "› " / hanging indent
+
+/// Screen rows for sticky pending prompts (always above activity / composer).
+fn pending_row_count(view: &TurnView) -> u16 {
+    if view.pending.is_empty() {
+        return 0;
+    }
+    // Each prompt: › text (+wrap) + time line + spacer. Cap so a flood of queues
+    // cannot steal the whole terminal.
+    let mut rows = 0usize;
+    for (i, p) in view.pending.iter().enumerate() {
+        // Approximate wrap at ~80 cols for layout; draw re-wraps to real width.
+        let text_rows = estimate_wrapped_lines(&p.text, 60).max(1);
+        rows += text_rows + 1; // text + timestamp
+        if i + 1 < view.pending.len() {
+            rows += 1; // spacer between queued items
+        }
+    }
+    rows.min(12) as u16
+}
+
+fn draw_pending(frame: &mut Frame, area: Rect, view: &TurnView) {
+    if area.height == 0 || view.pending.is_empty() {
+        return;
+    }
+    let width = area.width.max(20);
+    let mut lines: Vec<Line> = Vec::new();
+    for (i, p) in view.pending.iter().enumerate() {
+        // Same look as a real user prompt (green), sticky until the turn ends.
+        lines.extend(hanging_wrap_lines(TranscriptKind::User, &p.text, width));
+        lines.push(Line::from(vec![
+            Span::styled("  ", Style::default().fg(Color::DarkGray)),
+            Span::styled(
+                format!("{} · queued", p.time),
+                Style::default().fg(Color::DarkGray),
+            ),
+        ]));
+        if i + 1 < view.pending.len() {
+            lines.push(Line::from(""));
+        }
+        if lines.len() as u16 >= area.height {
+            break;
+        }
+    }
+    // Clip to allocated rows.
+    if lines.len() > area.height as usize {
+        lines.truncate(area.height as usize);
+    }
+    frame.render_widget(Paragraph::new(lines), area);
+}
+
+fn draw_fork_picker(frame: &mut Frame, area: Rect, view: &TurnView) {
+    let Some(picker) = view.fork_picker.as_ref() else {
+        return;
+    };
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(1),
+            Constraint::Min(3),
+            Constraint::Length(1),
+        ])
+        .split(area);
+
+    frame.render_widget(
+        Paragraph::new(Span::styled(
+            " Undo to message · ↑↓ select · Enter restore · Esc cancel ",
+            Style::default()
+                .fg(Color::Black)
+                .bg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        )),
+        chunks[0],
+    );
+
+    let height = chunks[1].height as usize;
+    let n = picker.items.len();
+    // Keep selection visible.
+    let mut start = 0usize;
+    if picker.selected >= height {
+        start = picker.selected + 1 - height;
+    }
+    let end = (start + height).min(n);
+    let mut lines: Vec<Line> = Vec::new();
+    for (i, item) in picker.items.iter().enumerate().skip(start).take(end - start) {
+        let selected = i == picker.selected;
+        let style = if selected {
+            Style::default()
+                .fg(Color::Black)
+                .bg(Color::Green)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(Color::White)
+        };
+        let mark = if selected { "› " } else { "  " };
+        lines.push(Line::from(Span::styled(
+            format!("{mark}{}", item.label),
+            style,
+        )));
+    }
+    if lines.is_empty() {
+        lines.push(Line::from(Span::styled(
+            "  (no user messages)",
+            Style::default().fg(Color::DarkGray),
+        )));
+    }
+    frame.render_widget(Paragraph::new(lines), chunks[1]);
+    frame.render_widget(
+        Paragraph::new(Span::styled(
+            format!(
+                " {}/{} · restores conversation + undoes file writes after this turn ",
+                picker.selected.saturating_add(1).min(n.max(1)),
+                n
+            ),
+            Style::default().fg(Color::DarkGray),
+        )),
+        chunks[2],
+    );
+}
+
+fn draw_overlay(frame: &mut Frame, area: Rect, view: &mut TurnView) {
+    let Some(ov) = view.overlay.as_ref() else {
+        return;
+    };
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(1),
+            Constraint::Min(3),
+            Constraint::Length(1),
+        ])
+        .split(area);
+
+    frame.render_widget(
+        Paragraph::new(Span::styled(
+            " Transcript · PgUp/PgDn scroll · Esc / Ctrl+T close ",
+            Style::default()
+                .fg(Color::Black)
+                .bg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        )),
+        chunks[0],
+    );
+
+    let width = chunks[1].width.max(20);
+    // Expand each logical row with hanging wrap so scroll counts screen lines.
+    let expanded: Vec<Line> = ov
+        .lines
+        .iter()
+        .flat_map(|row| hanging_wrap_lines(row.kind, &row.text, width))
+        .collect();
+    let height = chunks[1].height as usize;
+    let total = expanded.len();
+    let max_scroll = total.saturating_sub(height.max(1));
+    let scroll = ov.scroll_offset.min(max_scroll);
+    // scroll_offset 0 = bottom (latest), matching main transcript.
+    let end = total.saturating_sub(scroll);
+    let start = end.saturating_sub(height.max(1));
+    let visible = expanded[start..end].to_vec();
+    view.last_content_lines = total;
+    view.last_viewport_rows = height.max(1);
+
+    // Pre-wrapped with hanging indent — do not re-wrap (would lose indent).
+    frame.render_widget(Paragraph::new(visible), chunks[1]);
+    frame.render_widget(
+        Paragraph::new(Span::styled(
+            format!(" {start}–{end} / {total} · drag to select "),
+            Style::default().fg(Color::DarkGray),
+        )),
+        chunks[2],
+    );
+}
+
+fn draw_header(frame: &mut Frame, area: Rect, view: &TurnView) {
+    let left = Span::styled(
+        view.header_left.as_str(),
+        Style::default()
+            .fg(Color::Cyan)
+            .add_modifier(Modifier::BOLD),
+    );
+    let right = Span::styled(
+        view.header_right.as_str(),
+        Style::default().fg(Color::DarkGray),
+    );
+    let width = area.width as usize;
+    let pad = width
+        .saturating_sub(view.header_left.chars().count())
+        .saturating_sub(view.header_right.chars().count())
+        .max(1);
+    frame.render_widget(
+        Paragraph::new(Line::from(vec![
+            left,
+            Span::raw(" ".repeat(pad)),
+            right,
+        ])),
+        area,
+    );
+}
+
+fn is_tool_block(kind: TranscriptKind) -> bool {
+    matches!(
+        kind,
+        TranscriptKind::ToolDone | TranscriptKind::ToolError | TranscriptKind::ToolBody
+    )
+}
+
+fn horizontal_rule_line(width: u16) -> Line<'static> {
+    Line::from(Span::styled(
+        "─".repeat((width as usize).max(8)),
+        Style::default().fg(Color::DarkGray),
+    ))
+}
+
+// ─── Height estimation (no allocations of full line vectors) ────────────────
+
+fn estimate_wrapped_lines(text: &str, width: usize) -> usize {
+    let w = width.max(1);
+    let mut total = 0usize;
+    for para in text.split('\n') {
+        let n = para.chars().count();
+        total += if n == 0 { 1 } else { n.div_ceil(w) };
+    }
+    total.max(1)
+}
+
+fn kind_prefix(kind: TranscriptKind) -> (&'static str, Style) {
+    match kind {
+        TranscriptKind::User => ("› ", Style::default().fg(Color::Green)),
+        TranscriptKind::UserTime => ("  ", Style::default().fg(Color::DarkGray)),
+        TranscriptKind::Spacer => ("", Style::default()),
+        TranscriptKind::Thought => ("◆ ", Style::default().fg(Color::DarkGray)),
+        TranscriptKind::ToolDone => ("◔ ", Style::default().fg(Color::White)),
+        TranscriptKind::ToolError => ("◔ ", Style::default().fg(Color::Red)),
+        TranscriptKind::ToolBody => ("  ", Style::default().fg(Color::White)),
+        TranscriptKind::Info => ("◇ ", Style::default().fg(Color::DarkGray)),
+        // Legacy mid-stream queue rows (no longer emitted); treat like user.
+        TranscriptKind::Queued => ("› ", Style::default().fg(Color::Green)),
+        TranscriptKind::Assistant => ("", Style::default().fg(Color::White)),
+    }
+}
+
+fn estimate_row_height(row: &TranscriptLine, width: u16, prev_tool: bool) -> usize {
+    match row.kind {
+        TranscriptKind::Assistant => {
+            let hr = if prev_tool { 3 } else { 0 };
+            hr + estimate_wrapped_lines(&row.text, width as usize)
+        }
+        TranscriptKind::Spacer => 1,
+        kind => {
+            // Match hanging_wrap_lines exactly (word-break can exceed naive ceil).
+            let indent = kind_prefix(kind).0.chars().count();
+            let content_w = (width as usize).saturating_sub(indent).max(1);
+            wrap_text_chunks(&row.text, content_w).len().max(1)
+        }
+    }
+}
+
+// ─── On-the-fly line builders (only for the visible window) ─────────────────
+
+/// Word-wrap `text` into chunks of at most `width` display chars.
+/// Breaks on whitespace when possible (paragraph-style).
+fn wrap_text_chunks(text: &str, width: usize) -> Vec<String> {
+    let width = width.max(1);
+    let mut out = Vec::new();
+    for para in text.split('\n') {
+        if para.is_empty() {
+            out.push(String::new());
+            continue;
+        }
+        let mut rest = para;
+        while !rest.is_empty() {
+            let take = rest
+                .char_indices()
+                .nth(width)
+                .map(|(i, _)| i)
+                .unwrap_or(rest.len());
+            let split = if take < rest.len() {
+                rest[..take]
+                    .rfind(char::is_whitespace)
+                    .filter(|&i| i > 0)
+                    .unwrap_or(take)
+            } else {
+                take
+            };
+            let (chunk, next) = rest.split_at(split);
+            out.push(chunk.trim_end().to_string());
+            rest = next.trim_start();
+        }
+    }
+    if out.is_empty() {
+        out.push(String::new());
+    }
+    out
+}
+
+/// Prefixed rows with **hanging indent**: wrap continuations align with the
+/// first letter of the body (after `◔ ` / `› ` / …), not column 0.
+///
+/// ```text
+/// ◔ Search for 'long pattern' in rust files at
+///   crates/furcode_main/src · 0.1s
+/// ```
+fn hanging_wrap_lines(kind: TranscriptKind, text: &str, width: u16) -> Vec<Line<'static>> {
+    let (prefix, style) = kind_prefix(kind);
+    let indent = prefix.chars().count();
+    let content_w = (width as usize).saturating_sub(indent).max(1);
+    let cont_prefix = " ".repeat(indent);
+    let chunks = wrap_text_chunks(text, content_w);
+
+    chunks
+        .into_iter()
+        .enumerate()
+        .map(|(i, chunk)| {
+            let lead = if i == 0 { prefix } else { cont_prefix.as_str() };
+            Line::from(vec![
+                Span::styled(lead.to_string(), style),
+                Span::styled(chunk, style),
+            ])
+        })
+        .collect()
+}
+
+fn plain_assistant_lines(md: &str, width: u16, prev_tool: bool) -> Vec<Line<'static>> {
+    let width = (width as usize).max(20);
+    let mut out = Vec::new();
+    if prev_tool {
+        out.push(Line::from(""));
+        out.push(horizontal_rule_line(width as u16));
+        out.push(Line::from(""));
+    }
+    let stripped = strip_md_light(md);
+    for para in stripped.split('\n') {
+        if para.is_empty() {
+            out.push(Line::from(""));
+            continue;
+        }
+        let mut rest = para;
+        while !rest.is_empty() {
+            let take = rest
+                .char_indices()
+                .nth(width)
+                .map(|(i, _)| i)
+                .unwrap_or(rest.len());
+            let split = if take < rest.len() {
+                rest[..take]
+                    .rfind(char::is_whitespace)
+                    .filter(|&i| i > 0)
+                    .unwrap_or(take)
+            } else {
+                take
+            };
+            let (chunk, next) = rest.split_at(split);
+            out.push(Line::from(Span::styled(
+                chunk.trim_end().to_string(),
+                Style::default().fg(Color::White),
+            )));
+            rest = next.trim_start();
+        }
+    }
+    if out.is_empty() {
+        out.push(Line::from(""));
+    }
+    out
+}
+
+fn strip_md_light(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            '*' | '_' | '`' => {
+                while chars.peek() == Some(&c) {
+                    chars.next();
+                }
+            }
+            '#' if out.is_empty() || out.ends_with('\n') => {
+                while matches!(chars.peek(), Some('#') | Some(' ')) {
+                    if chars.peek() == Some(&' ') {
+                        chars.next();
+                        break;
+                    }
+                    chars.next();
+                }
+            }
+            _ => out.push(c),
+        }
+    }
+    out
+}
+
+fn rich_assistant_lines(md: &str, width: u16, prev_tool: bool) -> Vec<Line<'static>> {
+    let mut lines = Vec::new();
+    if prev_tool {
+        lines.push(Line::from(""));
+        lines.push(horizontal_rule_line(width));
+        lines.push(Line::from(""));
+    }
+    lines.extend(super::markdown::markdown_to_lines(md, width));
+    if lines.is_empty() {
+        lines.push(Line::from(""));
+    }
+    lines
+}
+
+// ─── Cache sync / enrich / collect ──────────────────────────────────────────
+
+fn sync_heights(cache: &mut TranscriptCache, view: &TurnView, width: u16) {
+    if cache.width != width {
+        cache.rich.clear();
+        cache.measured.clear();
+        cache.width = width;
+        cache.revision = u64::MAX;
+    }
+
+    let n = view.transcript.len();
+    cache.heights.resize(n, 1);
+
+    let mut prev_tool = false;
+    for (i, row) in view.transcript.iter().enumerate() {
+        // Prefer measured rich height when we already rendered this row.
+        let h = if let Some(rich) = cache.rich.get(&i) {
+            if rich.text_len == row.text.len() && row.kind == TranscriptKind::Assistant {
+                let h = rich.lines.len().max(1);
+                cache.measured.insert(i, (row.text.len(), h));
+                h
+            } else {
+                // Source changed (streaming) — drop stale rich + measured.
+                cache.rich.remove(&i);
+                cache.measured.remove(&i);
+                estimate_row_height(row, width, prev_tool)
+            }
+        } else if row.kind == TranscriptKind::Assistant {
+            // Keep last rich measurement after eviction (scroll away) so total
+            // height does not collapse mid-session.
+            if let Some(&(len, h)) = cache.measured.get(&i) {
+                if len == row.text.len() {
+                    h
+                } else {
+                    cache.measured.remove(&i);
+                    estimate_row_height(row, width, prev_tool)
+                }
+            } else {
+                estimate_row_height(row, width, prev_tool)
+            }
+        } else {
+            estimate_row_height(row, width, prev_tool)
+        };
+        cache.heights[i] = h;
+        prev_tool = is_tool_block(row.kind);
+    }
+
+    // Drop entries that no longer exist.
+    cache.rich.retain(|&i, _| i < n);
+    cache.measured.retain(|&i, _| i < n);
+    cache.revision = view.transcript_gen;
+    cache.recompute_offsets();
+}
+
+fn prev_was_tool(view: &TurnView, idx: usize) -> bool {
+    idx > 0 && is_tool_block(view.transcript[idx - 1].kind)
+}
+
+fn lazy_enrich(cache: &mut TranscriptCache, view: &TurnView, width: u16, start: usize, end: usize) {
+    if view.transcript.is_empty() {
+        return;
+    }
+    let over_start = start.saturating_sub(RICH_OVERSCAN);
+    let over_end = (end + RICH_OVERSCAN).min(cache.total_lines.max(end));
+
+    // Which transcript indices intersect the overscan window?
+    let mut needed: Vec<usize> = Vec::new();
+    for i in 0..view.transcript.len() {
+        if view.transcript[i].kind != TranscriptKind::Assistant {
+            continue;
+        }
+        let rs = cache.offsets[i];
+        let re = cache.offsets[i + 1];
+        if re > over_start && rs < over_end {
+            needed.push(i);
+        }
+    }
+
+    // Cap how many we keep rich — prefer closest to viewport centre / bottom.
+    if needed.len() > MAX_RICH_ROWS {
+        // Keep the last MAX_RICH_ROWS (toward latest when at bottom).
+        needed = needed.split_off(needed.len() - MAX_RICH_ROWS);
+    }
+
+    let needed_set: std::collections::HashSet<usize> = needed.iter().copied().collect();
+    cache.rich.retain(|i, _| needed_set.contains(i));
+
+    let mut changed = false;
+    for &i in &needed {
+        let row = &view.transcript[i];
+        let stale = cache
+            .rich
+            .get(&i)
+            .map(|r| r.text_len != row.text.len())
+            .unwrap_or(true);
+        if !stale {
+            continue;
+        }
+        let lines = rich_assistant_lines(&row.text, width, prev_was_tool(view, i));
+        cache.heights[i] = lines.len().max(1);
+        cache.rich.insert(
+            i,
+            RichRow {
+                text_len: row.text.len(),
+                lines,
+            },
+        );
+        changed = true;
+    }
+    if changed {
+        cache.recompute_offsets();
+    }
+}
+
+fn collect_visible(
+    cache: &TranscriptCache,
+    view: &TurnView,
+    width: u16,
+    start: usize,
+    end: usize,
+) -> Vec<Line<'static>> {
+    if start >= end || view.transcript.is_empty() {
+        return Vec::new();
+    }
+    let mut out = Vec::with_capacity(end.saturating_sub(start));
+    for i in 0..view.transcript.len() {
+        let row_start = cache.offsets[i];
+        let row_end = cache.offsets[i + 1];
+        if row_end <= start {
+            continue;
+        }
+        if row_start >= end {
+            break;
+        }
+        let row = &view.transcript[i];
+        // Borrow rich if present; else build plain only for this visible slice.
+        let owned: Vec<Line<'static>>;
+        let lines: &[Line<'static>] = if let Some(rich) = cache.rich.get(&i) {
+            &rich.lines
+        } else if row.kind == TranscriptKind::Assistant {
+            owned = plain_assistant_lines(&row.text, width, prev_was_tool(view, i));
+            // Can't return ref to local — extend directly below.
+            let local_start = start.saturating_sub(row_start);
+            let local_end = (end.saturating_sub(row_start)).min(owned.len());
+            if local_start < local_end {
+                out.extend(owned[local_start..local_end].iter().cloned());
+            }
+            continue;
+        } else {
+            owned = hanging_wrap_lines(row.kind, &row.text, width);
+            &owned
+        };
+
+        let local_start = start.saturating_sub(row_start);
+        let local_end = (end.saturating_sub(row_start)).min(lines.len());
+        if local_start < local_end {
+            out.extend(lines[local_start..local_end].iter().cloned());
+        }
+    }
+    out
+}
+
+/// Prewarm only the visible tail — no full-history clone needed by the caller
+/// if they pass a view locked on the draw thread. Safe to call after resume.
+pub fn prewarm_transcript_cache(view: &TurnView, width: u16) {
+    let width = width.max(20);
+    TRANSCRIPT_CACHE.with(|cell| {
+        let mut cache = cell.borrow_mut();
+        sync_heights(&mut cache, view, width);
+        let total = cache.total_lines;
+        let start = total.saturating_sub(40 + RICH_OVERSCAN);
+        lazy_enrich(&mut cache, view, width, start, total);
+    });
+}
+
+fn draw_transcript(frame: &mut Frame, area: Rect, view: &mut TurnView) {
+    let width = area.width.max(20);
+    let viewport = area.height as usize;
+
+    let (visible, scrolled) = TRANSCRIPT_CACHE.with(|cell| {
+        let mut cache = cell.borrow_mut();
+        sync_heights(&mut cache, view, width);
+
+        // Absolute viewport (`follow_bottom` / `viewport_end`) does not need
+        // preserve_scroll_anchor — growth at the bottom never moves the window
+        // unless the user is following.
+        let content_rows_guess = viewport.saturating_sub(1).max(1);
+        view.last_content_lines = cache.total_lines;
+        view.last_viewport_rows = content_rows_guess;
+        view.clamp_scroll();
+
+        let scrolled0 = !view.follow_bottom && cache.total_lines > content_rows_guess;
+        let content_rows = if scrolled0 {
+            viewport.saturating_sub(1)
+        } else {
+            viewport
+        };
+        view.last_viewport_rows = content_rows.max(1);
+        view.clamp_scroll();
+
+        let (start, end) = view.visible_range(cache.total_lines, content_rows);
+        lazy_enrich(&mut cache, view, width, start, end);
+
+        // Heights may grow after enrich; clamp end only, never re-follow.
+        view.last_content_lines = cache.total_lines;
+        view.clamp_scroll();
+        let (start, end) = view.visible_range(cache.total_lines, content_rows);
+        let scrolled = !view.follow_bottom && cache.total_lines > content_rows;
+
+        let visible = collect_visible(&cache, view, width, start, end);
+        (visible, scrolled)
+    });
+
+    let body_area = if scrolled {
+        Rect {
+            x: area.x,
+            y: area.y,
+            width: area.width,
+            height: area.height.saturating_sub(1),
+        }
+    } else {
+        area
+    };
+
+    if visible.is_empty() {
+        let hint = if view.status_line.is_some() {
+            "Preparing transcript…"
+        } else if view.busy {
+            "Waiting for the model…"
+        } else {
+            "Type a message below and press Enter"
+        };
+        frame.render_widget(
+            Paragraph::new(Span::styled(hint, Style::default().fg(Color::DarkGray))),
+            body_area,
+        );
+    } else {
+        // Lines are already hard-wrapped with hanging indent for tool/user rows.
+        // Re-enabling Wrap would break continuations back to column 0.
+        frame.render_widget(Paragraph::new(visible), body_area);
+    }
+
+    if scrolled && area.height > 0 {
+        let bar_y = area.y.saturating_add(area.height.saturating_sub(1));
+        frame.render_widget(
+            Paragraph::new(Line::from(vec![
+                Span::raw(" ".repeat(
+                    (area.width.saturating_sub(JUMP_BOTTOM_LABEL.chars().count() as u16) / 2)
+                        as usize,
+                )),
+                Span::styled(
+                    JUMP_BOTTOM_LABEL.to_string(),
+                    Style::default()
+                        .fg(Color::Black)
+                        .bg(Color::Cyan)
+                        .add_modifier(Modifier::BOLD),
+                ),
+            ])),
+            Rect {
+                x: area.x,
+                y: bar_y,
+                width: area.width,
+                height: 1,
+            },
+        );
+        view.jump_bottom_hit = Some(HitRect {
+            x: area.x,
+            y: bar_y,
+            width: area.width.max(1),
+            height: 1,
+        });
+    } else {
+        view.jump_bottom_hit = None;
+    }
+}
+
+fn draw_activity(frame: &mut Frame, area: Rect, view: &TurnView, tick: u64) {
+    let frame_ch = SPINNER[(tick as usize) % SPINNER.len()];
+    let mut lines: Vec<Line> = Vec::new();
+
+    if let Some(status) = view.status_line.as_deref() {
+        lines.push(Line::from(vec![
+            Span::styled(format!("{frame_ch} "), Style::default().fg(Color::Cyan)),
+            Span::styled(status.to_string(), Style::default().fg(Color::DarkGray)),
+        ]));
+        frame.render_widget(Paragraph::new(lines), area);
+        return;
+    }
+
+    match &view.activity {
+        ActivityPhase::Idle => {
+            if view.busy {
+                lines.push(Line::from(Span::styled(
+                    format!("{frame_ch} Working…"),
+                    Style::default().fg(Color::Cyan),
+                )));
+            }
+        }
+        ActivityPhase::Thinking { started, buffer } => {
+            let secs = started.elapsed().as_secs_f64();
+            lines.push(Line::from(vec![
+                Span::styled(format!("{frame_ch} "), Style::default().fg(Color::Cyan)),
+                Span::styled("Thinking", Style::default().fg(Color::Cyan)),
+                Span::styled(
+                    format!(" · {secs:.1}s"),
+                    Style::default().fg(Color::DarkGray),
+                ),
+            ]));
+            for preview in TurnView::last_preview_lines(buffer, 2) {
+                let trunc: String = preview
+                    .chars()
+                    .take(area.width.saturating_sub(4) as usize)
+                    .collect();
+                lines.push(Line::from(vec![
+                    Span::styled("  │ ", Style::default().fg(Color::DarkGray)),
+                    Span::styled(trunc, Style::default().fg(Color::DarkGray)),
+                ]));
+            }
+        }
+        ActivityPhase::Tool {
+            started,
+            label,
+            output,
+            is_error,
+        } => {
+            let secs = started.elapsed().as_secs_f64();
+            let spin = if *is_error { Color::Red } else { Color::Cyan };
+            lines.push(Line::from(vec![
+                Span::styled(format!("{frame_ch} "), Style::default().fg(spin)),
+                Span::styled(label.as_str(), Style::default().fg(Color::White)),
+                Span::styled(
+                    format!(" · {secs:.1}s"),
+                    Style::default().fg(Color::DarkGray),
+                ),
+            ]));
+            for preview in TurnView::last_preview_lines(output, 2) {
+                let trunc: String = preview
+                    .chars()
+                    .take(area.width.saturating_sub(4) as usize)
+                    .collect();
+                lines.push(Line::from(vec![
+                    Span::styled("  │ ", Style::default().fg(Color::DarkGray)),
+                    Span::styled(trunc, Style::default().fg(Color::White)),
+                ]));
+            }
+        }
+    }
+    frame.render_widget(Paragraph::new(lines), area);
+}
+
+fn composer_content_width(term_width: u16) -> usize {
+    (term_width as usize)
+        .saturating_sub(COMPOSER_PREFIX_COLS)
+        .max(1)
+}
+
+fn composer_row_count(buffer: &str, term_width: u16) -> u16 {
+    let w = composer_content_width(term_width);
+    let n = soft_wrap_ranges(buffer, w).len().max(1);
+    (n as u16).clamp(1, COMPOSER_MAX_ROWS)
+}
+
+/// Soft-wrap into byte ranges (and hard splits on `\n`).
+/// Each range is `[start, end)` into `text` (end exclusive; does not include `\n`).
+fn soft_wrap_ranges(text: &str, width: usize) -> Vec<(usize, usize)> {
+    let width = width.max(1);
+    let mut out = Vec::new();
+    if text.is_empty() {
+        out.push((0, 0));
+        return out;
+    }
+
+    let mut line_start = 0usize;
+    for (i, ch) in text.char_indices() {
+        if ch == '\n' {
+            // Flush current line (may be empty).
+            wrap_segment(text, line_start, i, width, &mut out);
+            line_start = i + ch.len_utf8();
+        }
+    }
+    // Trailing segment after last newline (or whole buffer).
+    if line_start <= text.len() {
+        // If text ends with \n, still show an empty final line for the caret.
+        if line_start == text.len() && text.ends_with('\n') {
+            out.push((line_start, line_start));
+        } else if line_start < text.len() || out.is_empty() {
+            wrap_segment(text, line_start, text.len(), width, &mut out);
+        }
+    }
+    if out.is_empty() {
+        out.push((0, 0));
+    }
+    out
+}
+
+fn wrap_segment(text: &str, start: usize, end: usize, width: usize, out: &mut Vec<(usize, usize)>) {
+    if start >= end {
+        out.push((start, start));
+        return;
+    }
+    let mut rest = start;
+    while rest < end {
+        let slice = &text[rest..end];
+        let take = slice
+            .char_indices()
+            .nth(width)
+            .map(|(i, _)| i)
+            .unwrap_or(slice.len());
+        let split = if take < slice.len() {
+            slice[..take]
+                .rfind(char::is_whitespace)
+                .filter(|&i| i > 0)
+                .unwrap_or(take)
+        } else {
+            take
+        };
+        // Guarantee forward progress even for pathologically long “words”.
+        let split = split.max(1).min(slice.len());
+        let abs_end = rest + split;
+        out.push((rest, abs_end));
+        // Skip spaces so the next visual line starts on content.
+        let mut next = abs_end;
+        while next < end {
+            let Some(c) = text[next..].chars().next() else {
+                break;
+            };
+            if c == '\n' || !c.is_whitespace() {
+                break;
+            }
+            next += c.len_utf8();
+        }
+        if next <= rest {
+            next = (rest + 1).min(end);
+        }
+        rest = next;
+    }
+}
+
+/// Map buffer caret → (visual_row, col_in_content) for the full soft-wrap layout.
+fn composer_cursor_cell(buffer: &str, cursor: usize, content_width: usize) -> (usize, usize) {
+    let cursor = cursor.min(buffer.len());
+    let ranges = soft_wrap_ranges(buffer, content_width);
+    let mut best = 0usize;
+    for (row, &(start, end)) in ranges.iter().enumerate() {
+        if start > cursor {
+            break;
+        }
+        best = row;
+        if cursor <= end {
+            let col = buffer[start..cursor].chars().count();
+            return (row, col);
+        }
+    }
+    let (start, end) = ranges[best];
+    let col = buffer[start..end.min(buffer.len())].chars().count();
+    (best, col)
+}
+
+fn draw_composer(frame: &mut Frame, area: Rect, view: &TurnView) {
+    if area.height == 0 || area.width == 0 {
+        return;
+    }
+    let content_w = composer_content_width(area.width);
+    let ranges = soft_wrap_ranges(&view.composer.buffer, content_w);
+    let max_rows = area.height as usize;
+    let total = ranges.len().max(1);
+    let first = total.saturating_sub(max_rows);
+
+    let green = Style::default()
+        .fg(Color::Green)
+        .add_modifier(Modifier::BOLD);
+    let white = Style::default().fg(Color::White);
+
+    let mut lines: Vec<Line> = Vec::with_capacity(max_rows);
+    for (i, &(start, end)) in ranges.iter().enumerate().skip(first).take(max_rows) {
+        let chunk = &view.composer.buffer[start..end.min(view.composer.buffer.len())];
+        let prefix = if i == 0 { "› " } else { "  " };
+        let prefix_style = if i == 0 { green } else { white };
+        lines.push(Line::from(vec![
+            Span::styled(prefix.to_string(), prefix_style),
+            Span::styled(chunk.to_string(), white),
+        ]));
+    }
+    if lines.is_empty() {
+        lines.push(Line::from(vec![
+            Span::styled("› ".to_string(), green),
+            Span::styled(String::new(), white),
+        ]));
+    }
+    frame.render_widget(Paragraph::new(lines), area);
+
+    let cursor_byte = view.composer.cursor.min(view.composer.buffer.len());
+    let (full_row, col) = composer_cursor_cell(&view.composer.buffer, cursor_byte, content_w);
+    let vis_row = full_row.saturating_sub(first);
+    if vis_row < max_rows {
+        let x = area
+            .x
+            .saturating_add(COMPOSER_PREFIX_COLS as u16)
+            .saturating_add(col as u16)
+            .min(area.x.saturating_add(area.width.saturating_sub(1)));
+        let y = area.y.saturating_add(vis_row as u16);
+        frame.set_cursor_position(Position { x, y });
+    }
+}
+
+fn draw_footer(frame: &mut Frame, area: Rect, view: &TurnView) {
+    let help = if !view.is_at_bottom() {
+        "Wheel scroll · click ↓ bottom · Ctrl+T transcript · Ctrl+C quit"
+    } else if view.busy {
+        "Wheel scroll · Esc interrupt · Enter queue · Ctrl+T · Ctrl+C quit"
+    } else {
+        "Wheel scroll · Enter send · Esc Esc undo · Ctrl+T · Ctrl+C quit"
+    };
+    frame.render_widget(
+        Paragraph::new(Span::styled(help, Style::default().fg(Color::DarkGray))),
+        area,
+    );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::tui::view::TranscriptKind;
+
+    fn line_plain(line: &Line<'_>) -> String {
+        line.spans.iter().map(|s| s.content.as_ref()).collect()
+    }
+
+    #[test]
+    fn tool_wrap_uses_hanging_indent() {
+        // Long tool label like the one in the screenshot.
+        let text = "Search for 'pub struct Console|impl Console|PromptOutcome|fn prompt\\(' in rust files at crates/furcode_main/src · 0.1s";
+        let width = 60u16;
+        let lines = hanging_wrap_lines(TranscriptKind::ToolDone, text, width);
+        assert!(lines.len() >= 2, "expected wrap, got {}", lines.len());
+
+        let first = line_plain(&lines[0]);
+        let second = line_plain(&lines[1]);
+        assert!(first.starts_with("◔ "), "first={first:?}");
+        // Continuation aligns under the body (after "◔ "), not under column 0.
+        assert!(
+            second.starts_with("  ") && !second.starts_with("◔ "),
+            "second should hang-indent, got {second:?}"
+        );
+        // Body of continuation starts at same column as first body char.
+        let indent = "◔ ".chars().count();
+        assert_eq!(
+            second.chars().take(indent).all(|c| c == ' '),
+            true,
+            "indent must be {indent} spaces"
+        );
+        // Each rendered line fits the terminal width.
+        for (i, l) in lines.iter().enumerate() {
+            let n = line_plain(l).chars().count();
+            assert!(n <= width as usize, "line {i} too long: {n} > {width}");
+        }
+    }
+
+    #[test]
+    fn short_tool_stays_one_line() {
+        let lines = hanging_wrap_lines(TranscriptKind::ToolDone, "Read main.rs · 0.1s", 80);
+        assert_eq!(lines.len(), 1);
+        assert_eq!(line_plain(&lines[0]), "◔ Read main.rs · 0.1s");
+    }
+
+    #[test]
+    fn composer_soft_wraps_long_input() {
+        let text = "a".repeat(50);
+        let ranges = soft_wrap_ranges(&text, 20);
+        assert!(ranges.len() >= 3, "expected wrap, got {}", ranges.len());
+        assert_eq!(composer_row_count(&text, 22), 3.min(COMPOSER_MAX_ROWS as usize) as u16);
+        // Cursor at end sits on last visual row.
+        let (row, col) = composer_cursor_cell(&text, text.len(), 20);
+        assert_eq!(row, ranges.len() - 1);
+        assert_eq!(col, text.len() % 20);
+    }
+
+    #[test]
+    fn composer_empty_is_one_row() {
+        assert_eq!(composer_row_count("", 80), 1);
+        let (row, col) = composer_cursor_cell("", 0, 40);
+        assert_eq!((row, col), (0, 0));
+    }
+
+    #[test]
+    fn height_matches_hanging_wrap() {
+        let row = TranscriptLine {
+            kind: TranscriptKind::ToolDone,
+            text: "Search for 'async fn handle_dispatch(' at crates/furcode_main/src/ui.rs · 0.1s"
+                .into(),
+        };
+        let width = 48u16;
+        let h = estimate_row_height(&row, width, false);
+        let lines = hanging_wrap_lines(row.kind, &row.text, width);
+        assert_eq!(h, lines.len());
+    }
+}

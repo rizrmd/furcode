@@ -1,0 +1,5 @@
+[print_schema]
+file = "crates/furcode_repo/src/database/schema.rs"
+
+[migrations_directory]
+dir = "crates/furcode_repo/src/database/migrations"

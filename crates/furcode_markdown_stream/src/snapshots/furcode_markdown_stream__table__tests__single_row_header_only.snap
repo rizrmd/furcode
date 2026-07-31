@@ -1,0 +1,7 @@
+---
+source: crates/furcode_markdown_stream/src/table.rs
+expression: "render(vec![vec![\"Only\", \"Headers\"],])"
+---
+  ┌──────┬─────────┐
+  │ Only │ Headers │
+  └──────┴─────────┘

@@ -1,0 +1,1 @@
+Persists a durable harness improvement to the user config learnings file. Use when the user corrects a recurring mistake, states a lasting preference, or you discover a reusable rule that should apply in future sessions without recompiling. Keep content short (one rule or a few bullets). Do not store secrets, one-off task details, or large dumps.

@@ -1,0 +1,20 @@
+[package]
+name = "furcode_fs"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+tokio.workspace = true
+anyhow.workspace = true
+sha2.workspace = true
+hex.workspace = true
+infer = "0.22.0" # For binary file detection
+thiserror = "2.0"
+bstr.workspace = true
+
+furcode_domain.workspace = true
+
+[dev-dependencies]
+tempfile = "3.27.0"
+pretty_assertions = "1.4.0"
