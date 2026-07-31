@@ -34,10 +34,17 @@ pub enum UserAction {
     Interrupt,
     /// Reveal older turns from the slim history archive.
     LoadMoreHistory,
+    /// Double-Esc idle: open user-message history picker (fork/undo).
+    ForkHistory,
+    /// User confirmed a fork target from the picker.
+    ForkSelect {
+        /// Index into conversation context.messages of the chosen user turn.
+        message_index: usize,
+        /// Prompt text to pre-fill after truncating.
+        edit_text: String,
+    },
     /// Ctrl+C / quit.
     Quit,
-    /// Double-Esc in idle state: undo last file change.
-    UndoHistory(Option<String>),
 }
 
 /// Shared session state between draw thread and async host.
@@ -104,9 +111,9 @@ fn draw_loop(
 fn setup_terminal() -> Result<Terminal<CrosstermBackend<Stdout>>> {
     enable_raw_mode()?;
     let mut stdout = io::stdout();
-    // Mouse capture is required for wheel / trackpad scroll. Trade-off: the
-    // terminal no longer does native drag-to-select (use Cmd/Ctrl+C after
-    // selecting with Shift held in some terminals, or copy from overlay).
+    // Mouse capture: wheel scroll + app-side drag select (auto-copies).
+    // Native terminal select cannot share the mouse with capture; we paint the
+    // highlight and push text to the system clipboard on mouse-up instead.
     execute!(
         stdout,
         EnterAlternateScreen,
@@ -150,6 +157,17 @@ fn clipboard_text() -> Option<String> {
     }
 }
 
+/// Best-effort write to the system clipboard (drag-select copy).
+fn clipboard_set(text: &str) {
+    #[cfg(not(target_os = "android"))]
+    {
+        if let Ok(mut cb) = arboard::Clipboard::new() {
+            let _ = cb.set_text(text.to_string());
+        }
+    }
+    let _ = text;
+}
+
 fn run_draw(
     terminal: &mut Terminal<CrosstermBackend<Stdout>>,
     view: Arc<Mutex<TurnView>>,
@@ -173,7 +191,10 @@ fn run_draw(
         let (busy, view_gen) = {
             let v = view.lock().unwrap_or_else(|e| e.into_inner());
             (
-                v.busy || v.activity.is_busy() || v.status_line.is_some(),
+                v.busy
+                    || v.activity.is_busy()
+                    || v.status_line.is_some()
+                    || v.fork_picker.is_some(),
                 v.transcript_gen,
             )
         };
@@ -287,23 +308,49 @@ fn run_draw(
                     needs_draw = true;
                 }
                 Event::Mouse(me) => match me.kind {
-                    // Wheel / trackpad: accumulate, apply once after the burst.
-                    // ScrollUp = older history (positive scroll_by).
+                    // Wheel / trackpad — accumulate, apply once after the burst.
                     MouseEventKind::ScrollUp => {
+                        // Clear selection when scrolling so highlight stays sane.
+                        view.lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .clear_selection();
                         scroll_delta = scroll_delta.saturating_add(3);
                     }
                     MouseEventKind::ScrollDown => {
+                        view.lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .clear_selection();
                         scroll_delta = scroll_delta.saturating_sub(3);
                     }
-                    // Click the "↓ Jump to bottom" bar to re-follow.
                     MouseEventKind::Down(event::MouseButton::Left) => {
                         let mut v = view.lock().unwrap_or_else(|e| e.into_inner());
                         if let Some(hit) = v.jump_bottom_hit {
                             if hit.contains(me.column, me.row) {
                                 v.scroll_to_bottom();
+                                v.clear_selection();
+                                needs_draw = true;
+                                // skip starting a selection on the jump bar
+                            } else {
+                                v.selection_begin(me.column, me.row);
                                 needs_draw = true;
                             }
+                        } else {
+                            v.selection_begin(me.column, me.row);
+                            needs_draw = true;
                         }
+                    }
+                    MouseEventKind::Drag(event::MouseButton::Left) => {
+                        view.lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .selection_update(me.column, me.row);
+                        needs_draw = true;
+                    }
+                    MouseEventKind::Up(event::MouseButton::Left) => {
+                        let mut v = view.lock().unwrap_or_else(|e| e.into_inner());
+                        if let Some(text) = v.selection_end() {
+                            clipboard_set(&text);
+                        }
+                        needs_draw = true;
                     }
                     _ => {}
                 },
@@ -361,6 +408,61 @@ fn handle_key(
     action_tx: &mpsc::UnboundedSender<UserAction>,
     last_esc: &mut Instant,
 ) -> Result<KeyResult> {
+    // Fork picker (double-Esc) swallows navigation keys first.
+    {
+        let mut v = view.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(picker) = v.fork_picker.as_mut() {
+            match (code, modifiers) {
+                (KeyCode::Char('c'), KeyModifiers::CONTROL)
+                | (KeyCode::Char('q'), KeyModifiers::CONTROL) => return Ok(KeyResult::Quit),
+                (KeyCode::Esc, _) | (KeyCode::Char('q'), KeyModifiers::NONE) => {
+                    v.fork_picker = None;
+                    v.touch_transcript();
+                    return Ok(KeyResult::Changed);
+                }
+                (KeyCode::Up, _) | (KeyCode::PageUp, _) | (KeyCode::Char('k'), KeyModifiers::NONE) => {
+                    if picker.selected > 0 {
+                        picker.selected -= 1;
+                    }
+                    v.touch_transcript();
+                    return Ok(KeyResult::Changed);
+                }
+                (KeyCode::Down, _)
+                | (KeyCode::PageDown, _)
+                | (KeyCode::Char('j'), KeyModifiers::NONE) => {
+                    if picker.selected + 1 < picker.items.len() {
+                        picker.selected += 1;
+                    }
+                    v.touch_transcript();
+                    return Ok(KeyResult::Changed);
+                }
+                (KeyCode::Home, _) => {
+                    picker.selected = 0;
+                    v.touch_transcript();
+                    return Ok(KeyResult::Changed);
+                }
+                (KeyCode::End, _) => {
+                    picker.selected = picker.items.len().saturating_sub(1);
+                    v.touch_transcript();
+                    return Ok(KeyResult::Changed);
+                }
+                (KeyCode::Enter, _) => {
+                    if let Some(item) = picker.items.get(picker.selected).cloned() {
+                        v.fork_picker = None;
+                        v.touch_transcript();
+                        drop(v);
+                        let _ = action_tx.send(UserAction::ForkSelect {
+                            message_index: item.message_index,
+                            edit_text: item.edit_text,
+                        });
+                    }
+                    return Ok(KeyResult::Changed);
+                }
+                _ => return Ok(KeyResult::Ignored),
+            }
+        }
+    }
+
     // Overlay swallows most keys.
     {
         let mut v = view.lock().unwrap_or_else(|e| e.into_inner());
@@ -368,9 +470,7 @@ fn handle_key(
             match (code, modifiers) {
                 (KeyCode::Char('c'), KeyModifiers::CONTROL)
                 | (KeyCode::Char('q'), KeyModifiers::CONTROL) => return Ok(KeyResult::Quit),
-                (KeyCode::Char('t'), KeyModifiers::CONTROL)
-                | (KeyCode::Esc, _)
-                | (KeyCode::Char('q'), KeyModifiers::NONE) => {
+                (KeyCode::Esc, _) | (KeyCode::Char('q'), KeyModifiers::NONE) => {
                     v.close_overlay();
                     return Ok(KeyResult::Changed);
                 }
@@ -401,27 +501,12 @@ fn handle_key(
     match (code, modifiers) {
         (KeyCode::Char('c'), KeyModifiers::CONTROL)
         | (KeyCode::Char('q'), KeyModifiers::CONTROL) => Ok(KeyResult::Quit),
-        // Codex-style transcript overlay.
-        (KeyCode::Char('t'), KeyModifiers::CONTROL) => {
-            view.lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .toggle_overlay();
-            Ok(KeyResult::Changed)
-        }
         (KeyCode::PageUp, _) => Ok(KeyResult::ScrollPage { up: true }),
         (KeyCode::PageDown, _) => Ok(KeyResult::ScrollPage { up: false }),
-        // Alt/Ctrl+Up|Down: scroll transcript even while Working (arrows alone
-        // stay reserved for the composer caret).
-        (KeyCode::Up, m)
-            if m.contains(KeyModifiers::ALT) || m.contains(KeyModifiers::CONTROL) =>
-        {
-            Ok(KeyResult::ScrollLines { up: true, lines: 3 })
-        }
-        (KeyCode::Down, m)
-            if m.contains(KeyModifiers::ALT) || m.contains(KeyModifiers::CONTROL) =>
-        {
-            Ok(KeyResult::ScrollLines { up: false, lines: 3 })
-        }
+        // Arrow / Shift / Alt / Ctrl + Up|Down all scroll the transcript.
+        // (Composer is single-caret; Up/Down are free for scrolling.)
+        (KeyCode::Up, _) => Ok(KeyResult::ScrollLines { up: true, lines: 3 }),
+        (KeyCode::Down, _) => Ok(KeyResult::ScrollLines { up: false, lines: 3 }),
         (KeyCode::End, m)
             if m.contains(KeyModifiers::CONTROL) || m == KeyModifiers::NONE =>
         {
@@ -445,25 +530,23 @@ fn handle_key(
             }
             Ok(KeyResult::Changed)
         }
-        // Shift+Up/Down — reliable on macOS laptops where PgUp needs Fn.
-        (KeyCode::Up, m) if m.contains(KeyModifiers::SHIFT) => {
-            Ok(KeyResult::ScrollLines { up: true, lines: 5 })
-        }
-        (KeyCode::Down, m) if m.contains(KeyModifiers::SHIFT) => {
-            Ok(KeyResult::ScrollLines { up: false, lines: 5 })
-        }
         (KeyCode::Esc, _) => {
             let mut v = view.lock().unwrap_or_else(|e| e.into_inner());
             if v.busy {
                 v.request_interrupt();
                 interrupt.store(true, Ordering::SeqCst);
                 let _ = action_tx.send(UserAction::Interrupt);
-            } else if last_esc.elapsed() < Duration::from_millis(400) {
-                let _ = action_tx.send(UserAction::UndoHistory(None));
+            } else if !v.composer.buffer.trim().is_empty() {
+                // Non-empty composer: Esc clears (does not open transcript).
+                *last_esc = Instant::now() - Duration::from_secs(1);
+                v.composer.clear();
+            } else if last_esc.elapsed() < Duration::from_millis(900) {
+                // Double-Esc on empty composer → full transcript history overlay.
+                v.toggle_overlay();
                 *last_esc = Instant::now() - Duration::from_secs(1);
             } else {
+                // First Esc on empty: arm double-Esc window (no-op).
                 *last_esc = Instant::now();
-                v.composer.clear();
             }
             Ok(KeyResult::Changed)
         }

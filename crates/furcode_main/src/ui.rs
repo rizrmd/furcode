@@ -63,6 +63,51 @@ struct ConversationDump {
     related_conversations: Vec<Conversation>,
 }
 
+/// File paths written/patched/removed by tools after `from_index` (the chosen
+/// user turn). Used by double-Esc fork to undo code changes.
+fn collect_tool_paths_after(
+    messages: &[furcode_domain::MessageEntry],
+    from_index: usize,
+) -> Vec<String> {
+    use furcode_domain::{ContextMessage, ToolCallArguments};
+
+    let mut paths = Vec::new();
+    let start = from_index.saturating_add(1);
+    for entry in messages.iter().skip(start) {
+        let ContextMessage::Text(tm) = &entry.message else {
+            continue;
+        };
+        let Some(calls) = tm.tool_calls.as_ref() else {
+            continue;
+        };
+        for call in calls {
+            let name = call.name.as_str();
+            if !matches!(name, "write" | "patch" | "multi_patch" | "remove" | "undo") {
+                continue;
+            }
+            let path = match &call.arguments {
+                ToolCallArguments::Parsed(v) => v
+                    .get("file_path")
+                    .or_else(|| v.get("path"))
+                    .and_then(|x| x.as_str())
+                    .map(str::to_string),
+                ToolCallArguments::Unparsed(s) => serde_json::from_str::<serde_json::Value>(s)
+                    .ok()
+                    .and_then(|v| {
+                        v.get("file_path")
+                            .or_else(|| v.get("path"))
+                            .and_then(|x| x.as_str())
+                            .map(str::to_string)
+                    }),
+            };
+            if let Some(p) = path.filter(|s| !s.is_empty()) {
+                paths.push(p);
+            }
+        }
+    }
+    paths
+}
+
 /// Formats an MCP server config for display, redacting sensitive information.
 /// Returns the command/URL string only.
 fn format_mcp_server(server: &furcode_domain::McpServerConfig) -> String {
@@ -505,12 +550,16 @@ impl<A: API + ConsoleWriter + 'static, F: Fn(FurcodeConfig) -> A + Send + Sync> 
                         // No in-flight turn; already handled in the draw loop.
                         continue;
                     }
-                    Some(UserAction::UndoHistory) => {
-                        let mut v = session.view.lock().unwrap_or_else(|e| e.into_inner());
-                        v.push_transcript(crate::tui::TranscriptLine {
-                            kind: crate::tui::TranscriptKind::Info,
-                            text: "Undo history not yet implemented. Use Ctrl+Z or git checkout to undo changes.".into(),
-                        });
+                    Some(UserAction::ForkHistory) => {
+                        self.frame_tui_open_fork_picker(&session).await?;
+                        continue;
+                    }
+                    Some(UserAction::ForkSelect {
+                        message_index,
+                        edit_text,
+                    }) => {
+                        self.frame_tui_apply_fork(&session, message_index, edit_text)
+                            .await?;
                         continue;
                     }
                     Some(UserAction::Quit) | None => break,
@@ -576,7 +625,9 @@ impl<A: API + ConsoleWriter + 'static, F: Fn(FurcodeConfig) -> A + Send + Sync> 
                                     self.print_exit_resume_hint()?;
                                     return Ok(());
                                 }
-                                UserAction::Interrupt | UserAction::UndoHistory => {}
+                                UserAction::Interrupt
+                                | UserAction::ForkHistory
+                                | UserAction::ForkSelect { .. } => {}
                             }
                         }
                         break;
@@ -601,14 +652,8 @@ impl<A: API + ConsoleWriter + 'static, F: Fn(FurcodeConfig) -> A + Send + Sync> 
                             Some(UserAction::Interrupt) => {
                                 session.interrupt.store(true, std::sync::atomic::Ordering::SeqCst);
                             }
-                            Some(UserAction::UndoHistory) => {
-                                let mut v =
-                                    session.view.lock().unwrap_or_else(|e| e.into_inner());
-                                v.push_transcript(crate::tui::TranscriptLine {
-                                    kind: crate::tui::TranscriptKind::Info,
-                                    text: "Double-Esc undo is only available while idle.".into(),
-                                });
-                            }
+                            // Fork only while idle (after the current turn ends).
+                            Some(UserAction::ForkHistory) | Some(UserAction::ForkSelect { .. }) => {}
                             Some(UserAction::Quit) | None => {
                                 let _ = join_session(session).await;
                                 self.print_exit_resume_hint()?;
@@ -742,6 +787,181 @@ impl<A: API + ConsoleWriter + 'static, F: Fn(FurcodeConfig) -> A + Send + Sync> 
                 Box::pin(self.prompt()).await
             }
         }
+    }
+
+    /// Frame TUI: open the double-Esc user-message picker.
+    async fn frame_tui_open_fork_picker(
+        &mut self,
+        session: &crate::tui::TuiSession,
+    ) -> anyhow::Result<()> {
+        use crate::tui::{ForkItem, ForkPicker};
+        use furcode_domain::{ContextMessage, Role};
+
+        let Some(conversation_id) = self.state.conversation_id else {
+            let mut v = session.view.lock().unwrap_or_else(|e| e.into_inner());
+            v.push_transcript(crate::tui::TranscriptLine {
+                kind: crate::tui::TranscriptKind::Info,
+                text: "No conversation yet — send a message first, then Esc Esc to undo."
+                    .into(),
+            });
+            return Ok(());
+        };
+
+        let conversation = match self.api.conversation(&conversation_id).await? {
+            Some(c) => c,
+            None => {
+                let mut v = session.view.lock().unwrap_or_else(|e| e.into_inner());
+                v.push_transcript(crate::tui::TranscriptLine {
+                    kind: crate::tui::TranscriptKind::Info,
+                    text: "Conversation not found.".into(),
+                });
+                return Ok(());
+            }
+        };
+
+        let Some(context) = conversation.context.as_ref() else {
+            let mut v = session.view.lock().unwrap_or_else(|e| e.into_inner());
+            v.push_transcript(crate::tui::TranscriptLine {
+                kind: crate::tui::TranscriptKind::Info,
+                text: "No messages to undo to.".into(),
+            });
+            return Ok(());
+        };
+
+        let mut items: Vec<ForkItem> = context
+            .messages
+            .iter()
+            .enumerate()
+            .filter_map(|(index, entry)| {
+                let ContextMessage::Text(tm) = &entry.message else {
+                    return None;
+                };
+                if tm.role != Role::User || tm.droppable {
+                    return None;
+                }
+                // Only real typed prompts (raw_content) — same rule as history resume.
+                let edit_text = tm
+                    .raw_content
+                    .as_ref()
+                    .and_then(|v| v.as_user_prompt())
+                    .map(|p| p.as_str().trim().to_string())
+                    .filter(|s| !s.is_empty())?;
+                if edit_text.trim_start().starts_with('/') {
+                    return None;
+                }
+                let one_line = edit_text
+                    .lines()
+                    .find(|l| !l.trim().is_empty())
+                    .unwrap_or("")
+                    .trim();
+                let preview: String = one_line.chars().take(72).collect();
+                let label = if one_line.chars().count() > 72 {
+                    format!("{preview}…")
+                } else {
+                    preview.to_string()
+                };
+                Some(ForkItem {
+                    message_index: index,
+                    label,
+                    edit_text,
+                })
+            })
+            .collect();
+
+        if items.is_empty() {
+            let mut v = session.view.lock().unwrap_or_else(|e| e.into_inner());
+            v.push_transcript(crate::tui::TranscriptLine {
+                kind: crate::tui::TranscriptKind::Info,
+                text: "No user messages to restore.".into(),
+            });
+            return Ok(());
+        }
+
+        // Newest first.
+        items.reverse();
+        let mut v = session.view.lock().unwrap_or_else(|e| e.into_inner());
+        v.fork_picker = Some(ForkPicker {
+            items,
+            selected: 0,
+        });
+        v.touch_transcript();
+        Ok(())
+    }
+
+    /// Frame TUI: truncate conversation at a user turn, undo file writes after
+    /// it, rebuild transcript, and pre-fill the composer.
+    async fn frame_tui_apply_fork(
+        &mut self,
+        session: &crate::tui::TuiSession,
+        message_index: usize,
+        edit_text: String,
+    ) -> anyhow::Result<()> {
+        use crate::tui::bootstrap_from_conversation;
+
+        let Some(conversation_id) = self.state.conversation_id else {
+            return Ok(());
+        };
+
+        let mut conversation = self
+            .api
+            .conversation(&conversation_id)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("Conversation not found"))?;
+
+        let Some(mut context) = conversation.context.take() else {
+            return Ok(());
+        };
+
+        if message_index > context.messages.len() {
+            return Ok(());
+        }
+
+        // Collect file paths touched by tools after this user message (for undo).
+        let paths = collect_tool_paths_after(&context.messages, message_index);
+
+        // Drop the selected user message and everything after it.
+        context.messages.truncate(message_index);
+        conversation.context = Some(context);
+        self.api.upsert_conversation(conversation.clone()).await?;
+
+        // Best-effort code undo: reverse chronological order of writes.
+        let mut undone = 0usize;
+        for path in paths.into_iter().rev() {
+            if self.api.undo_file(path).await.is_ok() {
+                undone += 1;
+            }
+        }
+
+        // Rebuild frame transcript from remaining conversation.
+        let env = self.api.environment();
+        let boot = bootstrap_from_conversation(&conversation, &env);
+        {
+            let mut v = session.view.lock().unwrap_or_else(|e| e.into_inner());
+            v.transcript.clear();
+            v.history_archive = Some(boot.archive);
+            if !boot.visible.is_empty() {
+                v.extend_transcript(boot.visible);
+            }
+            v.composer.buffer = edit_text;
+            v.composer.cursor = v.composer.buffer.len();
+            v.pending.clear();
+            v.busy = false;
+            v.fork_picker = None;
+            v.scroll_to_bottom();
+            let note = if undone > 0 {
+                format!(
+                    "Restored conversation · undid {undone} file snapshot(s) · edit prompt & Enter"
+                )
+            } else {
+                "Restored conversation · edit prompt & Enter to continue".into()
+            };
+            v.push_transcript(crate::tui::TranscriptLine {
+                kind: crate::tui::TranscriptKind::Info,
+                text: note,
+            });
+            v.touch_transcript();
+        }
+        Ok(())
     }
 
     /// Double-Esc: pick a previous user message, truncate context after it, and

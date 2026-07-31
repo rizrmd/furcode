@@ -14,7 +14,10 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 
-use super::view::{ActivityPhase, HitRect, TranscriptKind, TranscriptLine, TurnView};
+use super::view::{
+    ActivityPhase, HitRect, SelectablePaint, TextSelection, TranscriptKind, TranscriptLine,
+    TurnView,
+};
 
 const SPINNER: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 const JUMP_BOTTOM_LABEL: &str = " ↓ Jump to bottom ";
@@ -105,7 +108,7 @@ pub fn draw(frame: &mut Frame, view: &mut TurnView, tick: u64) {
         return;
     }
 
-    // Full-screen transcript overlay (Ctrl+T).
+    // Full-screen transcript history (double-Esc).
     if view.overlay.is_some() {
         draw_overlay(frame, area, view);
         return;
@@ -276,7 +279,7 @@ fn draw_overlay(frame: &mut Frame, area: Rect, view: &mut TurnView) {
 
     frame.render_widget(
         Paragraph::new(Span::styled(
-            " Transcript · PgUp/PgDn scroll · Esc / Ctrl+T close ",
+            " Transcript history · wheel / PgUp/PgDn · drag select (auto-copy) · Esc close ",
             Style::default()
                 .fg(Color::Black)
                 .bg(Color::Cyan)
@@ -303,15 +306,74 @@ fn draw_overlay(frame: &mut Frame, area: Rect, view: &mut TurnView) {
     view.last_content_lines = total;
     view.last_viewport_rows = height.max(1);
 
-    // Pre-wrapped with hanging indent — do not re-wrap (would lose indent).
-    frame.render_widget(Paragraph::new(visible), chunks[1]);
+    // Store for app-side drag select + copy.
+    let plain: Vec<String> = visible.iter().map(line_plain_text).collect();
+    view.selectable = SelectablePaint {
+        area: HitRect {
+            x: chunks[1].x,
+            y: chunks[1].y,
+            width: chunks[1].width,
+            height: chunks[1].height,
+        },
+        rows: plain,
+    };
+    let painted = apply_selection_to_lines(&visible, chunks[1], view.selection.as_ref());
+    frame.render_widget(Paragraph::new(painted), chunks[1]);
     frame.render_widget(
         Paragraph::new(Span::styled(
-            format!(" {start}–{end} / {total} · drag to select "),
+            format!(" {start}–{end} / {total} · drag select · auto-copy "),
             Style::default().fg(Color::DarkGray),
         )),
         chunks[2],
     );
+}
+
+fn line_plain_text(line: &Line<'_>) -> String {
+    line.spans.iter().map(|s| s.content.as_ref()).collect()
+}
+
+/// Rebuild lines with reverse-video cells inside the active selection.
+fn apply_selection_to_lines(
+    lines: &[Line<'static>],
+    area: Rect,
+    selection: Option<&TextSelection>,
+) -> Vec<Line<'static>> {
+    let Some(sel) = selection else {
+        return lines.to_vec();
+    };
+    let sel_style = Style::default()
+        .fg(Color::Black)
+        .bg(Color::White)
+        .add_modifier(Modifier::BOLD);
+
+    lines
+        .iter()
+        .enumerate()
+        .map(|(i, line)| {
+            let y = area.y.saturating_add(i as u16);
+            let plain = line_plain_text(line);
+            if y < sel.normalized().0.row || y > sel.normalized().1.row {
+                return line.clone();
+            }
+            // Character-wise rebuild so selection works without Shift.
+            let mut out_spans: Vec<Span<'static>> = Vec::new();
+            let mut col = area.x;
+            for ch in plain.chars() {
+                let style = if sel.contains_cell(col, y) {
+                    sel_style
+                } else {
+                    Style::default().fg(Color::White)
+                };
+                out_spans.push(Span::styled(ch.to_string(), style));
+                col = col.saturating_add(1);
+            }
+            if out_spans.is_empty() {
+                line.clone()
+            } else {
+                Line::from(out_spans)
+            }
+        })
+        .collect()
 }
 
 fn draw_header(frame: &mut Frame, area: Rect, view: &TurnView) {
@@ -777,14 +839,34 @@ fn draw_transcript(frame: &mut Frame, area: Rect, view: &mut TurnView) {
         } else {
             "Type a message below and press Enter"
         };
+        view.selectable = SelectablePaint {
+            area: HitRect {
+                x: body_area.x,
+                y: body_area.y,
+                width: body_area.width,
+                height: body_area.height,
+            },
+            rows: vec![hint.to_string()],
+        };
         frame.render_widget(
             Paragraph::new(Span::styled(hint, Style::default().fg(Color::DarkGray))),
             body_area,
         );
     } else {
+        // Store plain rows for drag-select copy; paint with selection highlight.
+        let plain: Vec<String> = visible.iter().map(line_plain_text).collect();
+        view.selectable = SelectablePaint {
+            area: HitRect {
+                x: body_area.x,
+                y: body_area.y,
+                width: body_area.width,
+                height: body_area.height,
+            },
+            rows: plain,
+        };
+        let painted = apply_selection_to_lines(&visible, body_area, view.selection.as_ref());
         // Lines are already hard-wrapped with hanging indent for tool/user rows.
-        // Re-enabling Wrap would break continuations back to column 0.
-        frame.render_widget(Paragraph::new(visible), body_area);
+        frame.render_widget(Paragraph::new(painted), body_area);
     }
 
     if scrolled && area.height > 0 {
@@ -1052,11 +1134,11 @@ fn draw_composer(frame: &mut Frame, area: Rect, view: &TurnView) {
 
 fn draw_footer(frame: &mut Frame, area: Rect, view: &TurnView) {
     let help = if !view.is_at_bottom() {
-        "Wheel scroll · click ↓ bottom · Ctrl+T transcript · Ctrl+C quit"
+        "Wheel/↑↓ scroll · drag select (auto-copy) · End latest · Esc Esc history · Ctrl+C quit"
     } else if view.busy {
-        "Wheel scroll · Esc interrupt · Enter queue · Ctrl+T · Ctrl+C quit"
+        "Wheel/↑↓ · drag select · Esc interrupt · Enter queue · Esc Esc history · Ctrl+C quit"
     } else {
-        "Wheel scroll · Enter send · Esc Esc undo · Ctrl+T · Ctrl+C quit"
+        "Enter send · Wheel/↑↓ scroll · drag select (auto-copy) · Esc Esc history · Ctrl+C quit"
     };
     frame.render_widget(
         Paragraph::new(Span::styled(help, Style::default().fg(Color::DarkGray))),

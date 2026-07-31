@@ -250,6 +250,63 @@ impl HitRect {
     }
 }
 
+/// Terminal cell (column, row) for app-driven text selection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct CellPos {
+    pub col: u16,
+    pub row: u16,
+}
+
+/// Drag selection while mouse capture is on (wheel scroll still works).
+///
+/// Native terminal select cannot run alongside mouse capture; we paint the
+/// highlight ourselves and copy plain text to the system clipboard on mouse-up.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TextSelection {
+    pub anchor: CellPos,
+    pub focus: CellPos,
+    pub dragging: bool,
+}
+
+impl TextSelection {
+    /// Ordered (start, end) by row then column.
+    pub fn normalized(&self) -> (CellPos, CellPos) {
+        let a = self.anchor;
+        let b = self.focus;
+        if (a.row, a.col) <= (b.row, b.col) {
+            (a, b)
+        } else {
+            (b, a)
+        }
+    }
+
+    /// Whether cell `(col, row)` is inside the selection (inclusive).
+    pub fn contains_cell(&self, col: u16, row: u16) -> bool {
+        let (a, b) = self.normalized();
+        if row < a.row || row > b.row {
+            return false;
+        }
+        if a.row == b.row {
+            return col >= a.col && col <= b.col;
+        }
+        if row == a.row {
+            return col >= a.col;
+        }
+        if row == b.row {
+            return col <= b.col;
+        }
+        true
+    }
+}
+
+/// Last painted selectable surface (transcript body or full-screen overlay).
+#[derive(Debug, Clone, Default)]
+pub struct SelectablePaint {
+    pub area: HitRect,
+    /// One plain-text string per screen row inside `area` (no ANSI).
+    pub rows: Vec<String>,
+}
+
 /// Full interactive session view (one paint frame).
 #[derive(Debug, Clone)]
 pub struct TurnView {
@@ -296,6 +353,10 @@ pub struct TurnView {
     pub fork_picker: Option<ForkPicker>,
     /// Host should load more archive turns (scroll near top).
     pub load_more_requested: bool,
+    /// Active drag / completed text selection (app-side).
+    pub selection: Option<TextSelection>,
+    /// Plain text of the last painted selectable region (for copy).
+    pub selectable: SelectablePaint,
 }
 
 /// Ctrl+T overlay: browse the slim archive without bloating the main view.
@@ -347,7 +408,106 @@ impl Default for TurnView {
             overlay: None,
             fork_picker: None,
             load_more_requested: false,
+            selection: None,
+            selectable: SelectablePaint::default(),
         }
+    }
+}
+
+impl TurnView {
+    /// Begin a drag selection at a terminal cell.
+    pub fn selection_begin(&mut self, col: u16, row: u16) {
+        let pos = CellPos { col, row };
+        self.selection = Some(TextSelection {
+            anchor: pos,
+            focus: pos,
+            dragging: true,
+        });
+        self.touch_transcript();
+    }
+
+    /// Update the free end of the selection while dragging.
+    pub fn selection_update(&mut self, col: u16, row: u16) {
+        if let Some(sel) = self.selection.as_mut() {
+            if sel.dragging {
+                sel.focus = CellPos { col, row };
+                self.touch_transcript();
+            }
+        }
+    }
+
+    /// Finish drag; returns plain text to copy (if any).
+    pub fn selection_end(&mut self) -> Option<String> {
+        let Some(sel) = self.selection.as_mut() else {
+            return None;
+        };
+        sel.dragging = false;
+        let text = self.selected_plain_text();
+        if text.trim().is_empty() {
+            self.selection = None;
+            self.touch_transcript();
+            None
+        } else {
+            self.touch_transcript();
+            Some(text)
+        }
+    }
+
+    pub fn clear_selection(&mut self) {
+        if self.selection.take().is_some() {
+            self.touch_transcript();
+        }
+    }
+
+    /// Extract selected plain text from the last painted selectable rows.
+    pub fn selected_plain_text(&self) -> String {
+        let Some(sel) = self.selection.as_ref() else {
+            return String::new();
+        };
+        let paint = &self.selectable;
+        if paint.rows.is_empty() || paint.area.width == 0 {
+            return String::new();
+        }
+        let (a, b) = sel.normalized();
+        let mut out = String::new();
+        for (i, row_text) in paint.rows.iter().enumerate() {
+            let y = paint.area.y.saturating_add(i as u16);
+            if y < a.row || y > b.row {
+                continue;
+            }
+            let chars: Vec<char> = row_text.chars().collect();
+            let len = chars.len();
+            // Columns relative to the paint area origin.
+            let rel = |abs_col: u16| -> usize {
+                abs_col
+                    .saturating_sub(paint.area.x)
+                    .min(len.saturating_sub(0) as u16) as usize
+            };
+            let (start_c, end_c) = if a.row == b.row && y == a.row {
+                let s = rel(a.col);
+                let e = rel(b.col).min(len.saturating_sub(1));
+                (s, e.saturating_add(1).min(len))
+            } else if y == a.row {
+                (rel(a.col), len)
+            } else if y == b.row {
+                (0, rel(b.col).saturating_add(1).min(len))
+            } else {
+                (0, len)
+            };
+            if start_c < end_c && start_c < len {
+                let slice: String = chars[start_c..end_c.min(len)].iter().collect();
+                if !out.is_empty() {
+                    out.push('\n');
+                }
+                out.push_str(slice.trim_end());
+            } else if a.row != b.row && y > a.row && y < b.row {
+                // empty line in multi-line selection
+                if !out.is_empty() {
+                    out.push('\n');
+                }
+            }
+        }
+        out
     }
 }
 
@@ -447,7 +607,7 @@ impl TurnView {
             .unwrap_or_else(|| {
                 let mut v = vec![TranscriptLine {
                     kind: TranscriptKind::Info,
-                    text: "Transcript overlay · no archived history · Esc close".into(),
+                    text: "Transcript history · Esc close".into(),
                 }];
                 v.extend(self.transcript.iter().cloned());
                 v
@@ -710,10 +870,16 @@ impl TurnView {
         if self.last_viewport_rows == 0 {
             self.last_viewport_rows = 20;
         }
-        // At least one screen-line per transcript row as a lower bound.
-        let floor = self.transcript.len();
-        if floor > self.last_content_lines {
+        // Floor: each transcript row is at least one screen line. Prefer the
+        // last painted total (includes soft-wrap) when it is larger.
+        let floor = self.transcript.len().max(1);
+        if self.last_content_lines < floor {
             self.last_content_lines = floor;
+        }
+        // Never treat as "nothing to scroll" when we clearly have history.
+        if self.last_content_lines <= self.last_viewport_rows && self.transcript.len() > 3 {
+            // Estimate: assume ~2 visual lines per row until paint corrects.
+            self.last_content_lines = self.transcript.len().saturating_mul(2).max(floor);
         }
     }
 

@@ -123,13 +123,13 @@ impl HistoryArchive {
         }
     }
 
-    /// Full slim transcript for the Ctrl+T overlay (still no tool bodies).
+    /// Full slim transcript for the double-Esc history overlay (no tool bodies).
     pub fn overlay_lines(&self) -> Vec<TranscriptLine> {
         let mut out = Vec::new();
         out.push(TranscriptLine {
             kind: TranscriptKind::Info,
             text: format!(
-                "Transcript overlay · {} turn(s) · Esc/Ctrl+T close",
+                "Transcript history · {} turn(s) · Esc close",
                 self.turns.len()
             ),
         });
