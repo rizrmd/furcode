@@ -6,6 +6,7 @@
 
 use std::io::{self, Stdout};
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc as std_mpsc;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -28,7 +29,7 @@ use super::view::TurnView;
 /// Commands from the TUI draw thread → async host.
 #[derive(Debug, Clone)]
 pub enum UserAction {
-    /// Idle Enter: send this message on the agent path.
+    /// Idle Enter: send this message on the agent path (or slash-command path).
     Send(String),
     /// Esc while busy.
     Interrupt,
@@ -47,13 +48,63 @@ pub enum UserAction {
     Quit,
 }
 
+/// Control messages from the host → draw thread (suspend for interactive widgets).
+enum DrawCtrl {
+    /// Leave alt-screen + raw mode so host can run `FurcodeWidget` pickers.
+    Suspend {
+        done: std_mpsc::SyncSender<()>,
+    },
+    /// Re-enter alt-screen after a suspend.
+    Resume {
+        done: std_mpsc::SyncSender<()>,
+    },
+}
+
 /// Shared session state between draw thread and async host.
 pub struct TuiSession {
     pub view: Arc<Mutex<TurnView>>,
     /// Set by Esc; host aborts the in-flight chat future.
     pub interrupt: Arc<AtomicBool>,
     pub actions: mpsc::UnboundedReceiver<UserAction>,
+    draw_ctrl: std_mpsc::Sender<DrawCtrl>,
     _draw: tokio::task::JoinHandle<()>,
+}
+
+/// Guard that keeps the draw loop suspended until dropped.
+pub struct TuiSuspendGuard {
+    draw_ctrl: std_mpsc::Sender<DrawCtrl>,
+}
+
+impl Drop for TuiSuspendGuard {
+    fn drop(&mut self) {
+        let (done_tx, done_rx) = std_mpsc::sync_channel(0);
+        if self.draw_ctrl.send(DrawCtrl::Resume { done: done_tx }).is_ok() {
+            let _ = done_rx.recv_timeout(Duration::from_secs(5));
+        }
+    }
+}
+
+impl TuiSession {
+    /// Leave the alt-screen so interactive prompts (`FurcodeWidget`) can run.
+    ///
+    /// The draw loop stops painting and stops reading keys until the guard is
+    /// dropped.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the draw thread is gone or does not acknowledge.
+    pub fn suspend_terminal(&self) -> Result<TuiSuspendGuard> {
+        let (done_tx, done_rx) = std_mpsc::sync_channel(0);
+        self.draw_ctrl
+            .send(DrawCtrl::Suspend { done: done_tx })
+            .context("TUI draw thread is not running")?;
+        done_rx
+            .recv_timeout(Duration::from_secs(5))
+            .context("timed out waiting for TUI suspend")?;
+        Ok(TuiSuspendGuard {
+            draw_ctrl: self.draw_ctrl.clone(),
+        })
+    }
 }
 
 /// Result of a full TUI session after the draw thread exits.
@@ -72,11 +123,12 @@ pub fn start_session(header_left: String, header_right: String) -> Result<TuiSes
 
     let interrupt = Arc::new(AtomicBool::new(false));
     let (action_tx, action_rx) = mpsc::unbounded_channel();
+    let (ctrl_tx, ctrl_rx) = std_mpsc::channel();
 
     let view_draw = view.clone();
     let interrupt_draw = interrupt.clone();
     let draw = tokio::task::spawn_blocking(move || {
-        if let Err(err) = draw_loop(view_draw, interrupt_draw, action_tx) {
+        if let Err(err) = draw_loop(view_draw, interrupt_draw, action_tx, ctrl_rx) {
             tracing::error!(error = ?err, "TUI draw loop failed");
         }
     });
@@ -85,6 +137,7 @@ pub fn start_session(header_left: String, header_right: String) -> Result<TuiSes
         view,
         interrupt,
         actions: action_rx,
+        draw_ctrl: ctrl_tx,
         _draw: draw,
     })
 }
@@ -101,10 +154,12 @@ fn draw_loop(
     view: Arc<Mutex<TurnView>>,
     interrupt: Arc<AtomicBool>,
     action_tx: mpsc::UnboundedSender<UserAction>,
+    ctrl_rx: std_mpsc::Receiver<DrawCtrl>,
 ) -> Result<()> {
     let mut terminal = setup_terminal().context("failed to enter TUI terminal")?;
-    let result = run_draw(&mut terminal, view, interrupt, action_tx);
-    restore_terminal(&mut terminal).context("failed to restore terminal")?;
+    let result = run_draw(&mut terminal, view, interrupt, action_tx, ctrl_rx);
+    // After suspend, terminal may already be restored; best-effort clean up.
+    let _ = restore_terminal(&mut terminal);
     result
 }
 
@@ -173,6 +228,7 @@ fn run_draw(
     view: Arc<Mutex<TurnView>>,
     interrupt: Arc<AtomicBool>,
     action_tx: mpsc::UnboundedSender<UserAction>,
+    ctrl_rx: std_mpsc::Receiver<DrawCtrl>,
 ) -> Result<()> {
     let mut tick: u64 = 0;
     // Spinner ~10 Hz. Scroll/input redraw immediately on the next loop turn.
@@ -186,26 +242,63 @@ fn run_draw(
     let mut last_esc = Instant::now();
 
     loop {
+        // Host may ask us to leave alt-screen for interactive FurcodeWidget.
+        while let Ok(ctrl) = ctrl_rx.try_recv() {
+            match ctrl {
+                DrawCtrl::Suspend { done } => {
+                    let _ = restore_terminal(terminal);
+                    let _ = done.send(());
+                    // Block until Resume (ignore nested Suspend).
+                    loop {
+                        match ctrl_rx.recv() {
+                            Ok(DrawCtrl::Resume { done }) => {
+                                *terminal =
+                                    setup_terminal().context("failed to re-enter TUI after suspend")?;
+                                needs_draw = true;
+                                last_view_gen = u64::MAX;
+                                let _ = done.send(());
+                                break;
+                            }
+                            Ok(DrawCtrl::Suspend { done }) => {
+                                // Already suspended.
+                                let _ = done.send(());
+                            }
+                            Err(_) => return Ok(()),
+                        }
+                    }
+                }
+                DrawCtrl::Resume { done } => {
+                    // Spurious resume while active — ack so host does not hang.
+                    let _ = done.send(());
+                }
+            }
+        }
+
         // Always redraw while busy / loading / live activity, after input, or
         // when the host mutates the view (transcript_gen change).
-        let (busy, view_gen) = {
-            let v = view.lock().unwrap_or_else(|e| e.into_inner());
+        let (busy, view_gen, toast_on) = {
+            let mut v = view.lock().unwrap_or_else(|e| e.into_inner());
+            let toast_on = v.toast_active();
             (
                 v.busy
                     || v.activity.is_busy()
                     || v.status_line.is_some()
-                    || v.fork_picker.is_some(),
+                    || v.fork_picker.is_some()
+                    || v.command_picker.is_some()
+                    || toast_on,
                 v.transcript_gen,
+                toast_on,
             )
         };
         if needs_draw || busy || view_gen != last_view_gen {
             let mut v = view.lock().unwrap_or_else(|e| e.into_inner());
+            let _ = v.toast_active();
             last_view_gen = v.transcript_gen;
             terminal.draw(|f| render::draw(f, &mut v, tick))?;
             needs_draw = false;
         }
 
-        let timeout = if busy {
+        let timeout = if busy || toast_on {
             Duration::from_millis(50)
         } else {
             tick_rate.saturating_sub(last_tick.elapsed())
@@ -215,7 +308,17 @@ fn run_draw(
             if last_tick.elapsed() >= tick_rate {
                 tick = tick.wrapping_add(1);
                 last_tick = Instant::now();
-                if busy {
+                // ~every 500ms: detect screenshot on clipboard and toast
+                // "Image ready · Ctrl+V to paste" (Cmd+V often never arrives).
+                if tick % 10 == 0 {
+                    let mut v = view.lock().unwrap_or_else(|e| e.into_inner());
+                    let before = v.transcript_gen;
+                    v.poll_clipboard_image_hint();
+                    if v.transcript_gen != before || v.toast.is_some() {
+                        needs_draw = true;
+                    }
+                }
+                if busy || toast_on {
                     needs_draw = true;
                 }
             }
@@ -301,10 +404,18 @@ fn run_draw(
                             .scroll_by(scroll_delta);
                         scroll_delta = 0;
                     }
-                    view.lock()
-                        .unwrap_or_else(|e| e.into_inner())
-                        .composer
-                        .insert_str(&data);
+                    // Cmd+V with a screenshot: terminal may deliver empty
+                    // bracketed paste (or nothing). Prefer image when body is
+                    // empty; otherwise keep text paste (don't steal paths).
+                    let mut v = view.lock().unwrap_or_else(|e| e.into_inner());
+                    let prefer_image = data.trim().is_empty();
+                    if !v.try_paste_clipboard_image(prefer_image) {
+                        if !data.is_empty() {
+                            let wrapped = crate::paste::wrap_pasted_text(&data);
+                            v.composer.insert_str(&wrapped);
+                        }
+                    }
+                    v.sync_command_picker_from_composer();
                     needs_draw = true;
                 }
                 Event::Mouse(me) => match me.kind {
@@ -349,6 +460,7 @@ fn run_draw(
                         let mut v = view.lock().unwrap_or_else(|e| e.into_inner());
                         if let Some(text) = v.selection_end() {
                             clipboard_set(&text);
+                            v.toast_copied(&text);
                         }
                         needs_draw = true;
                     }
@@ -408,6 +520,141 @@ fn handle_key(
     action_tx: &mpsc::UnboundedSender<UserAction>,
     last_esc: &mut Instant,
 ) -> Result<KeyResult> {
+    // Slash-command menu swallows navigation / select first.
+    {
+        let mut v = view.lock().unwrap_or_else(|e| e.into_inner());
+        if v.command_picker.is_some() {
+            match (code, modifiers) {
+                (KeyCode::Char('c'), KeyModifiers::CONTROL)
+                | (KeyCode::Char('q'), KeyModifiers::CONTROL) => return Ok(KeyResult::Quit),
+                (KeyCode::Esc, _) => {
+                    // Dismiss menu; leave whatever is in the composer (`/query`).
+                    v.command_picker = None;
+                    v.touch_transcript();
+                    return Ok(KeyResult::Changed);
+                }
+                (KeyCode::Up, _)
+                | (KeyCode::PageUp, _)
+                | (KeyCode::Char('k'), KeyModifiers::NONE) => {
+                    if let Some(picker) = v.command_picker.as_mut() {
+                        if picker.selected == 0 {
+                            picker.selected = picker.filtered.len().saturating_sub(1);
+                        } else {
+                            picker.selected -= 1;
+                        }
+                    }
+                    v.touch_transcript();
+                    return Ok(KeyResult::Changed);
+                }
+                (KeyCode::Down, _)
+                | (KeyCode::PageDown, _)
+                | (KeyCode::Char('j'), KeyModifiers::NONE) => {
+                    if let Some(picker) = v.command_picker.as_mut() {
+                        if picker.selected + 1 >= picker.filtered.len() {
+                            picker.selected = 0;
+                        } else {
+                            picker.selected += 1;
+                        }
+                    }
+                    v.touch_transcript();
+                    return Ok(KeyResult::Changed);
+                }
+                (KeyCode::Home, _) => {
+                    if let Some(picker) = v.command_picker.as_mut() {
+                        picker.selected = 0;
+                    }
+                    v.touch_transcript();
+                    return Ok(KeyResult::Changed);
+                }
+                (KeyCode::End, _) => {
+                    if let Some(picker) = v.command_picker.as_mut() {
+                        picker.selected = picker.filtered.len().saturating_sub(1);
+                    }
+                    v.touch_transcript();
+                    return Ok(KeyResult::Changed);
+                }
+                (KeyCode::Tab, _) => {
+                    // Complete selected command into the composer (do not run yet).
+                    if let Some(item) = v
+                        .command_picker
+                        .as_ref()
+                        .and_then(|p| p.selected_item())
+                        .cloned()
+                    {
+                        let insert = format!("{} ", item.name);
+                        v.composer.buffer = insert.clone();
+                        v.composer.cursor = insert.len();
+                        v.command_picker = None;
+                        v.touch_transcript();
+                    }
+                    return Ok(KeyResult::Changed);
+                }
+                (KeyCode::Enter, _) => {
+                    // Prefer the highlighted command; otherwise submit the typed buffer.
+                    let selected = v
+                        .command_picker
+                        .as_ref()
+                        .and_then(|p| p.selected_item())
+                        .map(|i| i.name.clone());
+                    v.command_picker = None;
+                    if let Some(name) = selected {
+                        // Put the chosen command in the composer and submit via the
+                        // normal path (handles busy → sticky queue correctly).
+                        v.composer.buffer = name;
+                        v.composer.cursor = v.composer.buffer.len();
+                    }
+                    v.scroll_to_bottom();
+                    if let Some(msg) = v.submit_composer() {
+                        if !TurnView::composer_is_slash_command(&msg) {
+                            v.busy = true;
+                        }
+                        drop(v);
+                        let _ = action_tx.send(UserAction::Send(msg));
+                    }
+                    return Ok(KeyResult::Changed);
+                }
+                (KeyCode::Backspace, m)
+                    if m == KeyModifiers::NONE
+                        || m.contains(KeyModifiers::ALT)
+                        || m.contains(KeyModifiers::CONTROL) =>
+                {
+                    if m.contains(KeyModifiers::ALT) || m.contains(KeyModifiers::CONTROL) {
+                        v.composer.delete_word_backward();
+                    } else {
+                        v.composer.backspace();
+                    }
+                    v.sync_command_picker_from_composer();
+                    return Ok(KeyResult::Changed);
+                }
+                (KeyCode::Char(c), m)
+                    if m == KeyModifiers::NONE || m == KeyModifiers::SHIFT =>
+                {
+                    if v.resume_prompt.is_some()
+                        || matches!(
+                            v.status_tone,
+                            crate::tui::StatusTone::Interrupted | crate::tui::StatusTone::Hint
+                        )
+                    {
+                        v.disarm_interrupt_resume();
+                    }
+                    v.composer.insert_char(c);
+                    v.sync_command_picker_from_composer();
+                    return Ok(KeyResult::Changed);
+                }
+                // Left/Right still move the caret inside the `/query` token.
+                (KeyCode::Left, m) if m == KeyModifiers::NONE => {
+                    v.composer.move_left();
+                    return Ok(KeyResult::Changed);
+                }
+                (KeyCode::Right, m) if m == KeyModifiers::NONE => {
+                    v.composer.move_right();
+                    return Ok(KeyResult::Changed);
+                }
+                _ => return Ok(KeyResult::Ignored),
+            }
+        }
+    }
+
     // Fork picker (double-Esc) swallows navigation keys first.
     {
         let mut v = view.lock().unwrap_or_else(|e| e.into_inner());
@@ -532,29 +779,40 @@ fn handle_key(
         }
         (KeyCode::Esc, _) => {
             let mut v = view.lock().unwrap_or_else(|e| e.into_inner());
-            if v.busy {
+            // Esc priority: clear composer text first; only then interrupt / fork.
+            if !v.composer.buffer.is_empty() {
+                // Any draft (including whitespace-only) is discarded.
+                // Do not arm double-Esc or interrupt while text remains.
+                *last_esc = Instant::now() - Duration::from_secs(1);
+                v.composer.clear();
+            } else if v.busy {
+                // Empty composer + in-flight turn → interrupt.
                 v.request_interrupt();
                 interrupt.store(true, Ordering::SeqCst);
                 let _ = action_tx.send(UserAction::Interrupt);
-            } else if !v.composer.buffer.trim().is_empty() {
-                // Non-empty composer: Esc clears (does not open transcript).
-                *last_esc = Instant::now() - Duration::from_secs(1);
-                v.composer.clear();
             } else if last_esc.elapsed() < Duration::from_millis(900) {
-                // Double-Esc on empty composer → full transcript history overlay.
-                v.toggle_overlay();
+                // Double-Esc on empty composer → pick a prior user message to
+                // restore conversation (+ undo file writes after that turn).
+                if v.overlay.is_some() {
+                    v.close_overlay();
+                }
+                let _ = action_tx.send(UserAction::ForkHistory);
                 *last_esc = Instant::now() - Duration::from_secs(1);
             } else {
-                // First Esc on empty: arm double-Esc window (no-op).
+                // First Esc on empty: arm double-Esc window (no-op UI).
                 *last_esc = Instant::now();
             }
             Ok(KeyResult::Changed)
         }
         (KeyCode::Enter, _) => {
             let mut v = view.lock().unwrap_or_else(|e| e.into_inner());
+            v.command_picker = None;
             v.scroll_to_bottom();
             if let Some(msg) = v.submit_composer() {
-                v.busy = true;
+                // Slash / shell commands are handled by the host without busy chrome.
+                if !TurnView::composer_is_slash_command(&msg) {
+                    v.busy = true;
+                }
                 drop(v);
                 let _ = action_tx.send(UserAction::Send(msg));
             }
@@ -563,28 +821,25 @@ fn handle_key(
         (KeyCode::Backspace, m)
             if m.contains(KeyModifiers::ALT) || m.contains(KeyModifiers::CONTROL) =>
         {
-            view.lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .composer
-                .delete_word_backward();
+            let mut v = view.lock().unwrap_or_else(|e| e.into_inner());
+            v.composer.delete_word_backward();
+            v.sync_command_picker_from_composer();
             Ok(KeyResult::Changed)
         }
         (KeyCode::Delete, m)
             if m.contains(KeyModifiers::ALT) || m.contains(KeyModifiers::CONTROL) =>
         {
-            view.lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .composer
-                .delete_word_forward();
+            let mut v = view.lock().unwrap_or_else(|e| e.into_inner());
+            v.composer.delete_word_forward();
+            v.sync_command_picker_from_composer();
             Ok(KeyResult::Changed)
         }
         (KeyCode::Char('\u{7f}' | '\u{8}'), m)
             if m.contains(KeyModifiers::ALT) || m.contains(KeyModifiers::CONTROL) =>
         {
-            view.lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .composer
-                .delete_word_backward();
+            let mut v = view.lock().unwrap_or_else(|e| e.into_inner());
+            v.composer.delete_word_backward();
+            v.sync_command_picker_from_composer();
             Ok(KeyResult::Changed)
         }
         (KeyCode::Left, m)
@@ -606,17 +861,15 @@ fn handle_key(
             Ok(KeyResult::Changed)
         }
         (KeyCode::Backspace, _) => {
-            view.lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .composer
-                .backspace();
+            let mut v = view.lock().unwrap_or_else(|e| e.into_inner());
+            v.composer.backspace();
+            v.sync_command_picker_from_composer();
             Ok(KeyResult::Changed)
         }
         (KeyCode::Delete, _) => {
-            view.lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .composer
-                .delete_forward();
+            let mut v = view.lock().unwrap_or_else(|e| e.into_inner());
+            v.composer.delete_forward();
+            v.sync_command_picker_from_composer();
             Ok(KeyResult::Changed)
         }
         (KeyCode::Left, _) => {
@@ -655,24 +908,21 @@ fn handle_key(
             Ok(KeyResult::Changed)
         }
         (KeyCode::Char('w'), KeyModifiers::CONTROL) => {
-            view.lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .composer
-                .delete_word_backward();
+            let mut v = view.lock().unwrap_or_else(|e| e.into_inner());
+            v.composer.delete_word_backward();
+            v.sync_command_picker_from_composer();
             Ok(KeyResult::Changed)
         }
         (KeyCode::Char('h'), KeyModifiers::CONTROL) => {
-            view.lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .composer
-                .backspace();
+            let mut v = view.lock().unwrap_or_else(|e| e.into_inner());
+            v.composer.backspace();
+            v.sync_command_picker_from_composer();
             Ok(KeyResult::Changed)
         }
         (KeyCode::Char('d'), m) if m.contains(KeyModifiers::ALT) => {
-            view.lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .composer
-                .delete_word_forward();
+            let mut v = view.lock().unwrap_or_else(|e| e.into_inner());
+            v.composer.delete_word_forward();
+            v.sync_command_picker_from_composer();
             Ok(KeyResult::Changed)
         }
         (KeyCode::Char('b'), m) if m.contains(KeyModifiers::ALT) => {
@@ -694,19 +944,35 @@ fn handle_key(
                 || m.contains(KeyModifiers::ALT)
                 || m.contains(KeyModifiers::SUPER) =>
         {
-            if let Some(text) = clipboard_text() {
-                view.lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .composer
-                    .insert_str(&text);
+            // Key-event paste (when the terminal does not emit Event::Paste).
+            // Prefer image: terminals rarely forward Cmd+V for image-only
+            // clipboards, so Ctrl+V is the reliable attach chord. PreferImage
+            // also wins when the toast just said "Image ready".
+            let mut v = view.lock().unwrap_or_else(|e| e.into_inner());
+            if !v.try_paste_clipboard_image(true) {
+                if let Some(text) = clipboard_text() {
+                    let wrapped = crate::paste::wrap_pasted_text(&text);
+                    v.composer.insert_str(&wrapped);
+                }
             }
+            v.sync_command_picker_from_composer();
             Ok(KeyResult::Changed)
         }
         (KeyCode::Char(c), m) if m == KeyModifiers::NONE || m == KeyModifiers::SHIFT => {
-            view.lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .composer
-                .insert_char(c);
+            let mut v = view.lock().unwrap_or_else(|e| e.into_inner());
+            // Typing a new draft dismisses Interrupted / resume hint chrome.
+            if v.resume_prompt.is_some()
+                || matches!(
+                    v.status_tone,
+                    crate::tui::StatusTone::Interrupted | crate::tui::StatusTone::Hint
+                )
+            {
+                v.disarm_interrupt_resume();
+            }
+            v.composer.insert_char(c);
+            // Opening `/` at the start of the buffer (or refining `/query`)
+            // shows the slash-command menu.
+            v.sync_command_picker_from_composer();
             Ok(KeyResult::Changed)
         }
         _ => Ok(KeyResult::Ignored),

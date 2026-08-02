@@ -620,7 +620,8 @@ impl From<&FurcodeCommandManager> for Info {
     fn from(command_manager: &FurcodeCommandManager) -> Self {
         let mut info = Info::new().add_title("COMMANDS");
 
-        for command in command_manager.list() {
+        // Menu-visible only (same set as the TUI `/` picker).
+        for command in command_manager.list_menu() {
             info = info.add_key_value(command.name, command.description);
         }
 
@@ -1208,8 +1209,12 @@ mod tests {
         // Should contain standard sections
         assert!(display.contains("COMMANDS"));
         assert!(display.contains("KEYBOARD SHORTCUTS"));
-        assert!(display.contains("<ctrl+c>"));
+        assert!(display.contains("<esc>"));
         assert!(display.contains("<ctrl+d>"));
+        // Core slash commands stay listed; clutter (e.g. tools) is hidden.
+        assert!(display.contains("new"));
+        assert!(display.contains("compact"));
+        assert!(!display.contains("commit-preview"));
     }
 
     #[test]

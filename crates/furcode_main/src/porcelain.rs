@@ -730,7 +730,7 @@ mod tests {
             .add_key_value("id", "000-000-000")
             .add_key_value("title", "make agents great again")
             .add_title("agent")
-            .add_key_value("id", "forge")
+            .add_key_value("id", "coding")
             .add_key_value("model", "sonnet-4");
 
         let actual = Porcelain::from(info).into_long();
@@ -754,7 +754,7 @@ mod tests {
             vec![
                 Some("agent".into()),
                 Some("id".into()),
-                Some("forge".into()),
+                Some("coding".into()),
             ],
             vec![
                 Some("agent".into()),

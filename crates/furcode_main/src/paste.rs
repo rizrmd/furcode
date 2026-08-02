@@ -365,10 +365,159 @@ pub fn clipboard_image_dir() -> PathBuf {
     std::env::temp_dir().join("furcode-paste")
 }
 
+/// Lightweight clipboard probe — no multi‑MB image decode.
+///
+/// Used by the TUI to toast “Image ready · Ctrl+V to paste” when a screenshot
+/// lands on the pasteboard. Terminals often swallow Cmd+V for image-only
+/// clipboards (no `Event::Paste`), so detection must not wait for a paste event.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct ClipboardProbe {
+    /// Platform change counter / generation (0 when unknown).
+    pub change_token: u64,
+    pub has_image: bool,
+    pub has_text: bool,
+}
+
+impl ClipboardProbe {
+    /// True when an image is available and text is not competing for paste.
+    pub fn image_ready_to_paste(self) -> bool {
+        self.has_image && !self.has_text
+    }
+}
+
+/// How aggressively to take an image over text on the clipboard.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ImagePasteMode {
+    /// Skip image when non-empty text is also present (safe for normal paste).
+    PreferText,
+    /// Always take the image when present (empty bracketed paste / explicit key).
+    PreferImage,
+}
+
+/// Probe whether the system clipboard currently holds image / text data.
+///
+/// On macOS this only inspects pasteboard *types* + `changeCount` (cheap).
+/// Elsewhere it may open the clipboard briefly; avoid calling on every frame.
+#[cfg(not(target_os = "android"))]
+pub fn probe_clipboard() -> ClipboardProbe {
+    #[cfg(target_os = "macos")]
+    {
+        return probe_clipboard_macos();
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        probe_clipboard_arboard()
+    }
+}
+
+#[cfg(target_os = "android")]
+pub fn probe_clipboard() -> ClipboardProbe {
+    ClipboardProbe::default()
+}
+
+/// macOS: `NSPasteboard` type list — no TIFF decode.
+#[cfg(target_os = "macos")]
+fn probe_clipboard_macos() -> ClipboardProbe {
+    use objc2::msg_send;
+    use objc2::rc::Retained;
+    use objc2::ClassType;
+    use objc2_app_kit::NSPasteboard;
+
+    let pasteboard: Option<Retained<NSPasteboard>> =
+        unsafe { msg_send![NSPasteboard::class(), generalPasteboard] };
+    let Some(pb) = pasteboard else {
+        return ClipboardProbe::default();
+    };
+
+    let change: isize = unsafe { msg_send![&*pb, changeCount] };
+    let change_token = u64::try_from(change).unwrap_or(0);
+
+    let mut has_image = false;
+    let mut has_text = false;
+
+    if let Some(types) = pb.types() {
+        for ty in types.iter() {
+            let name = ty.to_string();
+            let lower = name.to_ascii_lowercase();
+            if is_image_pasteboard_type(&lower) {
+                has_image = true;
+            }
+            // Plain string only — HTML/RTF alone must not block image paste
+            // (Chrome often puts public.html next to a PNG).
+            if is_plain_text_pasteboard_type(&lower) {
+                has_text = true;
+            }
+        }
+    }
+
+    // Confirm plain text is actually non-empty (type may be advertised empty).
+    if has_text {
+        if let Ok(mut cb) = arboard::Clipboard::new() {
+            match cb.get_text() {
+                Ok(t) if !t.trim().is_empty() => {}
+                _ => has_text = false,
+            }
+        }
+    }
+
+    ClipboardProbe {
+        change_token,
+        has_image,
+        has_text,
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn is_image_pasteboard_type(lower: &str) -> bool {
+    lower.contains("tiff")
+        || lower.contains("png")
+        || lower.contains("jpeg")
+        || lower.contains("jpg")
+        || lower.contains("gif")
+        || lower.contains("bmp")
+        || lower.contains("jp2")
+        || lower == "public.image"
+        || (lower.contains("image")
+            && !lower.contains("html")
+            && !lower.contains("icon")
+            && !lower.contains("dynamic"))
+}
+
+#[cfg(target_os = "macos")]
+fn is_plain_text_pasteboard_type(lower: &str) -> bool {
+    lower == "public.utf8-plain-text"
+        || lower == "public.utf16-plain-text"
+        || lower == "public.utf16-external-plain-text"
+        || lower == "nsstringpboardtype"
+        || lower.ends_with("plain-text")
+}
+
+/// Fallback probe via arboard (may decode image — used off the hot path).
+#[cfg(all(not(target_os = "android"), not(target_os = "macos")))]
+fn probe_clipboard_arboard() -> ClipboardProbe {
+    let mut probe = ClipboardProbe::default();
+    let Ok(mut cb) = arboard::Clipboard::new() else {
+        return probe;
+    };
+    match cb.get_text() {
+        Ok(t) if !t.trim().is_empty() => probe.has_text = true,
+        _ => {}
+    }
+    match cb.get_image() {
+        Ok(_) => probe.has_image = true,
+        Err(_) => {}
+    }
+    // No changeCount — bump token when content shape changes.
+    probe.change_token = u64::from(probe.has_image) | (u64::from(probe.has_text) << 1);
+    probe
+}
+
 /// Tries to read an image from the system clipboard and persist it as a PNG.
 ///
-/// When the clipboard also has non-empty text, returns `Ok(None)` so normal
-/// text paste (Cmd+V / Ctrl+V) is not hijacked by a leftover screenshot.
+/// With [`ImagePasteMode::PreferText`] (default), non-empty text wins so normal
+/// Cmd+V of a copied string is not stolen by a leftover screenshot.
+/// With [`ImagePasteMode::PreferImage`], image wins when present (empty paste
+/// body / explicit image paste key).
 ///
 /// On success returns a short display atom (`[Image N]`) registered for later
 /// expansion to `@[path]` at submit time.
@@ -382,15 +531,38 @@ pub fn clipboard_image_dir() -> PathBuf {
 ///   missing image content).
 #[cfg(not(target_os = "android"))]
 pub fn try_paste_clipboard_image() -> anyhow::Result<Option<String>> {
+    try_paste_clipboard_image_with(ImagePasteMode::PreferText)
+}
+
+/// See [`try_paste_clipboard_image`]; `mode` controls text-vs-image priority.
+#[cfg(not(target_os = "android"))]
+pub fn try_paste_clipboard_image_with(mode: ImagePasteMode) -> anyhow::Result<Option<String>> {
+    // macOS fast path: copy already-compressed PNG/JPEG off the pasteboard.
+    // arboard's get_image() decodes TIFF → full RGBA then we re-encode PNG —
+    // for a Retina screenshot that is tens of MB and multi-second.
+    #[cfg(target_os = "macos")]
+    {
+        if mode == ImagePasteMode::PreferText {
+            let probe = probe_clipboard_macos();
+            if probe.has_text {
+                return Ok(None);
+            }
+        }
+        if let Some(path) = save_macos_clipboard_image_fast()? {
+            return Ok(Some(register_image_atom(path)));
+        }
+        // No compressed bytes — fall through to arboard RGBA path.
+    }
+
     let mut clipboard = arboard::Clipboard::new()?;
 
-    // Prefer real text when both formats are present (don't steal Cmd+V of a
-    // copied string just because an older screenshot is still on the clipboard).
-    match clipboard.get_text() {
-        Ok(text) if !text.trim().is_empty() => return Ok(None),
-        Ok(_) | Err(arboard::Error::ContentNotAvailable) => {}
-        Err(_) => {
-            // Other text-read errors: still attempt image.
+    if mode == ImagePasteMode::PreferText {
+        match clipboard.get_text() {
+            Ok(text) if !text.trim().is_empty() => return Ok(None),
+            Ok(_) | Err(arboard::Error::ContentNotAvailable) => {}
+            Err(_) => {
+                // Other text-read errors: still attempt image.
+            }
         }
     }
 
@@ -403,16 +575,79 @@ pub fn try_paste_clipboard_image() -> anyhow::Result<Option<String>> {
     Ok(Some(register_image_atom(path)))
 }
 
+/// Dump pasteboard PNG/JPEG bytes straight to disk (no decode/re-encode).
+///
+/// Returns `Ok(None)` when those types are absent so callers can fall back.
+#[cfg(target_os = "macos")]
+fn save_macos_clipboard_image_fast() -> anyhow::Result<Option<PathBuf>> {
+    use objc2::msg_send;
+    use objc2::rc::Retained;
+    use objc2::ClassType;
+    use objc2_app_kit::{NSPasteboard, NSPasteboardTypePNG};
+    use objc2_foundation::ns_string;
+
+    let pasteboard: Option<Retained<NSPasteboard>> =
+        unsafe { msg_send![NSPasteboard::class(), generalPasteboard] };
+    let Some(pb) = pasteboard else {
+        return Ok(None);
+    };
+
+    // Prefer PNG (screenshots + most browsers). Then JPEG / other compressed.
+    // `NSPasteboardTypePNG` is an extern static — read inside unsafe.
+    let type_png = unsafe { NSPasteboardTypePNG };
+    let candidates: [(&objc2_foundation::NSString, &str); 6] = [
+        (type_png, "png"),
+        (ns_string!("public.png"), "png"),
+        (ns_string!("public.jpeg"), "jpg"),
+        (ns_string!("public.jpg"), "jpg"),
+        (ns_string!("public.jpeg-2000"), "jp2"),
+        (ns_string!("public.gif"), "gif"),
+    ];
+
+    for (ty, ext) in candidates {
+        if let Some(data) = pb.dataForType(ty) {
+            let bytes = data.to_vec();
+            if bytes.is_empty() {
+                continue;
+            }
+            let path = unique_clipboard_path(ext)?;
+            std::fs::write(&path, &bytes)?;
+            return Ok(Some(path));
+        }
+    }
+    Ok(None)
+}
+
+/// Unique path under [`clipboard_image_dir`] with the given extension.
+fn unique_clipboard_path(ext: &str) -> anyhow::Result<PathBuf> {
+    let dir = clipboard_image_dir();
+    std::fs::create_dir_all(&dir)?;
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    Ok(dir.join(format!("clipboard-{nanos}.{ext}")))
+}
+
 /// Android / no-clipboard builds: image paste is unsupported.
 #[cfg(target_os = "android")]
 pub fn try_paste_clipboard_image() -> anyhow::Result<Option<String>> {
     Ok(None)
 }
 
+#[cfg(target_os = "android")]
+pub fn try_paste_clipboard_image_with(_mode: ImagePasteMode) -> anyhow::Result<Option<String>> {
+    Ok(None)
+}
+
 /// Writes RGBA8 pixels to a unique PNG under [`clipboard_image_dir`].
+///
+/// Slow path used when the OS only exposes uncompressed pixels (or macOS
+/// compressed-type dump failed). Prefer platform-native dumps first.
 #[cfg(not(target_os = "android"))]
 fn save_rgba_as_png(width: usize, height: usize, rgba: &[u8]) -> anyhow::Result<PathBuf> {
-    use image::{ImageBuffer, Rgba};
+    use image::ImageEncoder;
+    use image::codecs::png::{CompressionType, FilterType, PngEncoder};
 
     let w = u32::try_from(width).map_err(|_| anyhow::anyhow!("image width too large"))?;
     let h = u32::try_from(height).map_err(|_| anyhow::anyhow!("image height too large"))?;
@@ -424,18 +659,17 @@ fn save_rgba_as_png(width: usize, height: usize, rgba: &[u8]) -> anyhow::Result<
         );
     }
 
-    let dir = clipboard_image_dir();
-    std::fs::create_dir_all(&dir)?;
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_nanos())
-        .unwrap_or(0);
-    let path = dir.join(format!("clipboard-{nanos}.png"));
-
-    let img: ImageBuffer<Rgba<u8>, Vec<u8>> =
-        ImageBuffer::from_raw(w, h, rgba[..expected].to_vec())
-            .ok_or_else(|| anyhow::anyhow!("invalid RGBA dimensions for clipboard image"))?;
-    img.save(&path)?;
+    let path = unique_clipboard_path("png")?;
+    // Fastest PNG settings — default compression is multi-second on retina shots.
+    let file = std::fs::File::create(&path)?;
+    let enc = PngEncoder::new_with_quality(file, CompressionType::Fast, FilterType::NoFilter);
+    enc.write_image(
+        &rgba[..expected],
+        w,
+        h,
+        image::ExtendedColorType::Rgba8,
+    )
+    .map_err(|e| anyhow::anyhow!("png encode: {e}"))?;
     Ok(path)
 }
 

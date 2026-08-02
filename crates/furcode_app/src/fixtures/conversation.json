@@ -971,7 +971,7 @@
           "content": "I see - this file is using a mix of the old struct syntax and the helper methods. This is going to require significant changes. Let me use the sage tool to understand the full scope and then make a comprehensive fix:",
           "tool_calls": [
             {
-              "name": "sage",
+              "name": "researching",
               "call_id": "toolu_01RMiDvRr14yRho8nzaekBnD",
               "arguments": {
                 "tasks": [
@@ -984,7 +984,7 @@
       },
       {
         "tool": {
-          "name": "sage",
+          "name": "researching",
           "call_id": "toolu_01RMiDvRr14yRho8nzaekBnD",
           "output": {
             "is_error": false,

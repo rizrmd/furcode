@@ -37,7 +37,8 @@ We keep the harness strengths:
 - [x] Product header + `›` composer
 - [x] Drop zsh integration surface
 - [ ] Approval / sandbox modes closer to Codex (policy UX polish)
-- [x] Frame TUI scaffold (`FURCODE_TUI=1`) — ratatui layout + live composer
-- [ ] Wire chat stream into `TurnView` (kill dual spinner / clear_lines path)
-- [ ] Default frame TUI; remove legacy line-oriented interactive path
-- [ ] Rebrand slash command docs and default agent display name
+- [x] Frame TUI scaffold — ratatui layout + live composer
+- [x] Wire chat stream into `TurnView`
+- [x] Default frame TUI; remove legacy line-oriented interactive REPL
+- [x] Rebrand slash command docs and default agent display name
+- [x] Rename built-in agent IDs to `coding` / `planning` / `researching`

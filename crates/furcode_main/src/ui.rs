@@ -1,11 +1,11 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use anyhow::{Context, Result};
 use colored::Colorize;
-use console::style;
+use console::{strip_ansi_codes, style};
 use convert_case::{Case, Casing};
 use furcode_api::{
     API, AgentId, AnyProvider, ApiKeyRequest, AuthContextRequest, AuthContextResponse, ChatRequest,
@@ -147,6 +147,26 @@ fn format_mcp_headers(server: &furcode_domain::McpServerConfig) -> Option<String
     }
 }
 
+/// Result of handling a slash command inside the frame TUI.
+enum FrameSlashOutcome {
+    /// Continue the idle loop (command finished).
+    Done,
+    /// `/new` finished — clear host-side queues and continue.
+    NewSession,
+    /// Exit the interactive session.
+    Quit,
+    /// Start an agent stream with this event (custom commands / retry).
+    Chat(Event),
+}
+
+/// Result of driving one agent stream in the frame TUI.
+enum FrameStreamOutcome {
+    /// Return to the idle prompt loop.
+    Continue,
+    /// User quit during the turn.
+    Quit,
+}
+
 pub struct UI<A: ConsoleWriter, F: Fn(FurcodeConfig) -> A> {
     markdown: MarkdownFormat,
     state: UIState,
@@ -159,6 +179,9 @@ pub struct UI<A: ConsoleWriter, F: Fn(FurcodeConfig) -> A> {
     config: FurcodeConfig,
     /// Messages typed while the agent was busy (sent after the current turn).
     pending_sends: VecDeque<String>,
+    /// When set, [`Self::writeln`] captures lines for the frame TUI transcript
+    /// instead of writing to the spinner/console (which is under alt-screen).
+    tui_output: Option<Arc<Mutex<Vec<String>>>>,
     #[allow(dead_code)] // The guard is kept alive by being held in the struct
     _guard: furcode_tracker::Guard,
 }
@@ -167,15 +190,27 @@ impl<A: API + ConsoleWriter + 'static, F: Fn(FurcodeConfig) -> A + Send + Sync> 
     /// Writes a line to the console output
     /// Takes anything that implements ToString trait
     fn writeln<T: ToString>(&mut self, content: T) -> anyhow::Result<()> {
+        if let Some(sink) = &self.tui_output {
+            sink.lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .push(content.to_string());
+            return Ok(());
+        }
         self.spinner.write_ln(content)
     }
 
     /// Writes a TitleFormat to the console output with proper formatting
     fn writeln_title(&mut self, title: TitleFormat) -> anyhow::Result<()> {
-        self.spinner.write_ln(title.display())
+        self.writeln(title.display())
     }
 
     fn writeln_to_stderr(&mut self, title: String) -> anyhow::Result<()> {
+        if let Some(sink) = &self.tui_output {
+            sink.lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .push(title);
+            return Ok(());
+        }
         self.spinner.ewrite_ln(title)
     }
 
@@ -250,8 +285,20 @@ impl<A: API + ConsoleWriter + 'static, F: Fn(FurcodeConfig) -> A + Send + Sync> 
         Ok(())
     }
 
-    // Handle creating a new conversation
+    /// Start a **brand-new** conversation with empty model context.
+    ///
+    /// `/new` means: stop using the current conversation history for the next
+    /// agent turn. The previous conversation remains in the DB (listable via
+    /// `/conversation`) but is no longer the active session — nothing from it
+    /// is sent to the model.
     async fn on_new(&mut self) -> Result<()> {
+        // Drop any binding to the previous conversation *before* re-init so we
+        // cannot accidentally keep chatting on the old id.
+        self.cli.conversation = None;
+        self.cli.conversation_id = None;
+        self.state.conversation_id = None;
+        self.pending_sends.clear();
+
         let config = furcode_config::FurcodeConfig::read().unwrap_or_default();
         self.config = config.clone();
         self.api = Arc::new((self.new_api)(config));
@@ -262,12 +309,28 @@ impl<A: API + ConsoleWriter + 'static, F: Fn(FurcodeConfig) -> A + Send + Sync> 
             self.api.set_active_agent(agent_id).await?;
         }
 
-        // Reset previously set CLI parameters by the user
-        self.cli.conversation = None;
-        self.cli.conversation_id = None;
+        // Immediately open a blank conversation (empty context). Lazy init on
+        // the next message used to work only if state stayed cleared — binding
+        // an empty id here makes the "fresh session" contract explicit.
+        let conversation = Conversation::generate();
+        let id = conversation.id;
+        debug_assert!(
+            conversation.context.is_none()
+                || conversation
+                    .context
+                    .as_ref()
+                    .is_some_and(|c| c.messages.is_empty()),
+            "/new must start with empty context"
+        );
+        self.api.upsert_conversation(conversation).await?;
+        self.state.conversation_id = Some(id);
 
         self.spinner.reset();
-        self.display_banner()?;
+        // Banner is for the line-oriented path; frame TUI clears its own surface.
+        if !crate::tui::enabled() {
+            self.display_banner()?;
+            self.print_conversation_status(true, id)?;
+        }
         self.trace_user();
         self.hydrate_caches();
         Ok(())
@@ -339,6 +402,7 @@ impl<A: API + ConsoleWriter + 'static, F: Fn(FurcodeConfig) -> A + Send + Sync> 
             markdown: MarkdownFormat::new(),
             config,
             pending_sends: VecDeque::new(),
+            tui_output: None,
             _guard: furcode_tracker::init_tracing(env.log_path(), TRACKER.clone())?,
         })
     }
@@ -427,7 +491,7 @@ impl<A: API + ConsoleWriter + 'static, F: Fn(FurcodeConfig) -> A + Send + Sync> 
         Ok(())
     }
 
-    /// Runs the new frame-based TUI (`FURCODE_TUI=1`) with a live agent stream.
+    /// Runs the frame-based interactive TUI (default interactive UI).
     async fn run_frame_tui(&mut self) -> Result<()> {
         use crate::tui::{
             LOAD_MORE_TURNS, UserAction, apply_chat_response, bootstrap_from_context_json,
@@ -447,16 +511,35 @@ impl<A: API + ConsoleWriter + 'static, F: Fn(FurcodeConfig) -> A + Send + Sync> 
             .api
             .get_active_agent()
             .await
-            .map(|a| a.to_string())
-            .unwrap_or_else(|| "FURCODE".into());
+            .map(|a| a.to_string());
         let model = self
             .get_agent_model(None)
             .await
             .map(|m| m.to_string())
             .unwrap_or_default();
-        let header_right = format!("{agent}  {model}");
+        let header_right = if let Some(a) = agent {
+            if a.is_empty() {
+                model
+            } else {
+                let display = match a.as_str() {
+                    "coding" => "CODING",
+                    "planning" => "PLANNING",
+                    "researching" => "RESEARCHING",
+                    other => other,
+                };
+                format!("{display}  {model}")
+            }
+        } else {
+            model
+        };
 
         let mut session = start_session(header_left, header_right)?;
+        // Populate slash-command catalog for the `/` picker.
+        {
+            let catalog = self.tui_command_catalog();
+            let mut v = session.view.lock().unwrap_or_else(|e| e.into_inner());
+            v.set_command_catalog(catalog);
+        }
 
         // Dual-tier resume via **raw context JSON** (never full Conversation decode —
         // tool output bodies alone are 50–90KB each and hung the previous path).
@@ -570,8 +653,66 @@ impl<A: API + ConsoleWriter + 'static, F: Fn(FurcodeConfig) -> A + Send + Sync> 
                 break;
             };
 
+            // Expand `[Image N]` clipboard atoms → `@[/tmp/furcode-paste/….png]`
+            // so the attachment pipeline sees real paths. Transcript keeps the atom.
+            let msg = crate::paste::expand_image_atoms(&msg);
+
             tracker::prompt(msg.clone());
             session.interrupt.store(false, std::sync::atomic::Ordering::SeqCst);
+
+            // Slash / shell commands: parse + local dispatch (not an agent turn).
+            if crate::tui::TurnView::composer_is_slash_command(&msg) {
+                match self.frame_tui_handle_slash(&session, &msg).await? {
+                    FrameSlashOutcome::Quit => {
+                        let _ = join_session(session).await;
+                        self.print_exit_resume_hint()?;
+                        return Ok(());
+                    }
+                    FrameSlashOutcome::Done => continue,
+                    FrameSlashOutcome::NewSession => {
+                        // Drop any prompts queued during the previous turn.
+                        pending.clear();
+                        self.pending_sends.clear();
+                        continue;
+                    }
+                    FrameSlashOutcome::Chat(event) => {
+                        // Fall through into the stream loop with a custom event
+                        // (workflow commands, retry, etc.).
+                        let turn_prompt = msg.clone();
+                        let conversation_id = self.init_conversation().await?;
+                        let chat = ChatRequest::new(event, conversation_id);
+                        let mut stream = self.api.chat(chat).await?;
+                        {
+                            let mut v = session.view.lock().unwrap_or_else(|e| e.into_inner());
+                            v.busy = true;
+                            v.disarm_interrupt_resume();
+                        }
+                        match self
+                            .frame_tui_drive_stream(
+                                &mut session,
+                                &mut stream,
+                                &mut pending,
+                                turn_prompt,
+                            )
+                            .await?
+                        {
+                            FrameStreamOutcome::Continue => {
+                                session
+                                    .interrupt
+                                    .store(false, std::sync::atomic::Ordering::SeqCst);
+                            }
+                            FrameStreamOutcome::Quit => {
+                                let _ = join_session(session).await;
+                                self.print_exit_resume_hint()?;
+                                return Ok(());
+                            }
+                        }
+                        continue;
+                    }
+                }
+            }
+
+            let turn_prompt = msg.clone();
 
             let conversation_id = self.init_conversation().await?;
             let chat = ChatRequest::new(Event::new(msg), conversation_id);
@@ -580,66 +721,273 @@ impl<A: API + ConsoleWriter + 'static, F: Fn(FurcodeConfig) -> A + Send + Sync> 
             {
                 let mut v = session.view.lock().unwrap_or_else(|e| e.into_inner());
                 v.busy = true;
+                // New turn: drop Interrupted status so Thinking shows normally.
+                v.disarm_interrupt_resume();
             }
 
-            // Drive the agent stream; Esc sets interrupt and aborts this select.
-            loop {
-                tokio::select! {
-                    biased;
-                    _ = async {
-                        while !session.interrupt.load(std::sync::atomic::Ordering::SeqCst) {
-                            tokio::time::sleep(Duration::from_millis(40)).await;
-                        }
-                    } => {
-                        {
-                            let mut v = session.view.lock().unwrap_or_else(|e| e.into_inner());
+            match self
+                .frame_tui_drive_stream(&mut session, &mut stream, &mut pending, turn_prompt)
+                .await?
+            {
+                FrameStreamOutcome::Continue => {
+                    session
+                        .interrupt
+                        .store(false, std::sync::atomic::Ordering::SeqCst);
+                }
+                FrameStreamOutcome::Quit => {
+                    let _ = join_session(session).await;
+                    self.print_exit_resume_hint()?;
+                    return Ok(());
+                }
+            }
+        }
+
+        let _ = join_session(session).await;
+        self.print_exit_resume_hint()?;
+        Ok(())
+    }
+
+    /// Build the slash-command catalog for the TUI `/` picker.
+    ///
+    /// Uses the menu-visible set only (internal / hide-list / agent-* omitted).
+    /// Cloud workspace commands are dropped when services are disabled.
+    fn tui_command_catalog(&self) -> Vec<crate::tui::CommandItem> {
+        let cloud = self.config.cloud_services_enabled();
+        self.command
+            .list_menu()
+            .into_iter()
+            .filter(|cmd| {
+                // Hide cloud-only entries when workspace services are off.
+                if !cloud
+                    && matches!(
+                        cmd.name.as_str(),
+                        "workspace-sync"
+                            | "workspace-status"
+                            | "workspace-info"
+                            | "workspace-init"
+                            | "index"
+                            | "sync"
+                            | "sync-status"
+                            | "sync-info"
+                            | "sync-init"
+                    )
+                {
+                    return false;
+                }
+                true
+            })
+            .map(|cmd| {
+                let name = if cmd.name.starts_with('!') {
+                    cmd.name
+                } else {
+                    format!("/{}", cmd.name)
+                };
+                crate::tui::CommandItem {
+                    name,
+                    description: cmd.description,
+                }
+            })
+            .collect()
+    }
+
+    /// Refresh header agent/model after a slash command that may change them.
+    async fn frame_tui_refresh_header(&self, session: &crate::tui::TuiSession) {
+        let agent = self
+            .api
+            .get_active_agent()
+            .await
+            .map(|a| a.to_string());
+        let model = self
+            .get_agent_model(None)
+            .await
+            .map(|m| m.to_string())
+            .unwrap_or_default();
+        let header_right = if let Some(a) = agent {
+            if a.is_empty() {
+                model
+            } else {
+                let display = match a.as_str() {
+                    "coding" => "CODING",
+                    "planning" => "PLANNING",
+                    "researching" => "RESEARCHING",
+                    other => other,
+                };
+                format!("{display}  {model}")
+            }
+        } else {
+            model
+        };
+        let mut v = session.view.lock().unwrap_or_else(|e| e.into_inner());
+        v.header_right = header_right;
+        v.touch_transcript();
+    }
+
+    /// Parse and run a slash/shell command from the frame TUI.
+    async fn frame_tui_handle_slash(
+        &mut self,
+        session: &crate::tui::TuiSession,
+        msg: &str,
+    ) -> Result<FrameSlashOutcome> {
+        let parsed = match self.command.parse(msg) {
+            Ok(cmd) => cmd,
+            Err(err) => {
+                let mut v = session.view.lock().unwrap_or_else(|e| e.into_inner());
+                v.busy = false;
+                v.push_transcript(crate::tui::TranscriptLine {
+                    kind: crate::tui::TranscriptKind::ToolError,
+                    text: format!("{err:#}"),
+                });
+                return Ok(FrameSlashOutcome::Done);
+            }
+        };
+
+        match parsed {
+            AppCommand::Message(text) => Ok(FrameSlashOutcome::Chat(Event::new(text))),
+            AppCommand::Custom(user_cmd) => Ok(FrameSlashOutcome::Chat(Event::from(user_cmd))),
+            AppCommand::Retry => Ok(FrameSlashOutcome::Chat(Event::empty())),
+            AppCommand::Exit => Ok(FrameSlashOutcome::Quit),
+            AppCommand::New => {
+                // Fresh conversation: new empty context + wipe the TUI surface.
+                let _suspend = session.suspend_terminal().ok();
+                let result = self.on_new().await;
+                drop(_suspend);
+
+                {
+                    let catalog = self.tui_command_catalog();
+                    let short_id = self
+                        .state
+                        .conversation_id
+                        .map(|id| {
+                            let s = id.into_string();
+                            // Show a short handle so the user can see it's a new id.
+                            if s.len() > 8 {
+                                format!("{}…", &s[..8])
+                            } else {
+                                s
+                            }
+                        })
+                        .unwrap_or_else(|| "—".into());
+                    let mut v = session.view.lock().unwrap_or_else(|e| e.into_inner());
+                    v.reset_session_view();
+                    v.set_command_catalog(catalog);
+                    match &result {
+                        Ok(()) => {
                             v.push_transcript(crate::tui::TranscriptLine {
                                 kind: crate::tui::TranscriptKind::Info,
-                                text: "Turn interrupted".into(),
+                                text: format!(
+                                    "New conversation · {short_id} · previous history not sent to the model"
+                                ),
                             });
-                            for m in v.commit_pending_to_transcript() {
-                                pending.push_back(m);
-                            }
-                            v.mark_idle();
                         }
-                        // Drain any actions that arrived during the turn.
-                        while let Ok(action) = session.actions.try_recv() {
-                            match action {
-                                UserAction::Send(m) => pending.push_back(m),
-                                UserAction::LoadMoreHistory => {
-                                    let mut v =
-                                        session.view.lock().unwrap_or_else(|e| e.into_inner());
-                                    if let Some(arch) = v.history_archive.as_mut() {
-                                        let res = arch.load_more(LOAD_MORE_TURNS);
-                                        if !res.lines.is_empty() {
-                                            v.apply_load_more(res.lines);
-                                        } else {
-                                            v.load_more_requested = false;
-                                        }
-                                    } else {
-                                        v.load_more_requested = false;
-                                    }
-                                }
-                                UserAction::Quit => {
-                                    let _ = join_session(session).await;
-                                    self.print_exit_resume_hint()?;
-                                    return Ok(());
-                                }
-                                UserAction::Interrupt
-                                | UserAction::ForkHistory
-                                | UserAction::ForkSelect { .. } => {}
-                            }
+                        Err(err) => {
+                            v.push_transcript(crate::tui::TranscriptLine {
+                                kind: crate::tui::TranscriptKind::ToolError,
+                                text: format!("{err:#}"),
+                            });
                         }
-                        break;
                     }
-                    action = session.actions.recv() => {
+                }
+                self.frame_tui_refresh_header(session).await;
+
+                match result {
+                    Ok(()) => Ok(FrameSlashOutcome::NewSession),
+                    Err(_) => Ok(FrameSlashOutcome::Done),
+                }
+            }
+            cmd => {
+                // Capture writeln output into the transcript; suspend so
+                // FurcodeWidget pickers can own the terminal.
+                let sink = Arc::new(Mutex::new(Vec::<String>::new()));
+                self.tui_output = Some(sink.clone());
+                // Leave alt-screen so FurcodeWidget pickers can own the TTY.
+                // If suspend fails we still run; writeln is captured either way.
+                let _suspend = session.suspend_terminal().ok();
+                let result = self.on_command(cmd).await;
+                drop(_suspend);
+                self.tui_output = None;
+
+                let lines = sink.lock().unwrap_or_else(|e| e.into_inner()).clone();
+                {
+                    let mut v = session.view.lock().unwrap_or_else(|e| e.into_inner());
+                    v.busy = false;
+                    for chunk in lines {
+                        for line in chunk.lines() {
+                            let plain = strip_ansi_codes(line).into_owned();
+                            if plain.trim().is_empty() {
+                                continue;
+                            }
+                            v.push_transcript(crate::tui::TranscriptLine {
+                                kind: crate::tui::TranscriptKind::Info,
+                                text: plain,
+                            });
+                        }
+                    }
+                    if let Err(err) = &result {
+                        v.push_transcript(crate::tui::TranscriptLine {
+                            kind: crate::tui::TranscriptKind::ToolError,
+                            text: format!("{err:#}"),
+                        });
+                    }
+                    // Refresh catalog (agent/workflow commands may have changed).
+                    // Catalog is rebuilt below after unlock.
+                    v.scroll_to_bottom();
+                }
+
+                // Re-sync slash catalog + header (agent/model may have changed).
+                {
+                    let catalog = self.tui_command_catalog();
+                    let mut v = session.view.lock().unwrap_or_else(|e| e.into_inner());
+                    v.set_command_catalog(catalog);
+                }
+                self.frame_tui_refresh_header(session).await;
+
+                match result {
+                    Ok(true) => Ok(FrameSlashOutcome::Quit),
+                    Ok(false) => Ok(FrameSlashOutcome::Done),
+                    Err(_) => Ok(FrameSlashOutcome::Done),
+                }
+            }
+        }
+    }
+
+    /// Drive one agent stream inside the frame TUI until idle or quit.
+    async fn frame_tui_drive_stream(
+        &mut self,
+        session: &mut crate::tui::TuiSession,
+        stream: &mut (impl StreamExt<Item = Result<ChatResponse>> + Unpin),
+        pending: &mut VecDeque<String>,
+        turn_prompt: String,
+    ) -> Result<FrameStreamOutcome> {
+        use crate::tui::{UserAction, apply_chat_response};
+
+        // Track whether apply already explained why the turn stopped.
+        let mut saw_terminal_reason = false;
+
+        loop {
+            tokio::select! {
+                biased;
+                _ = async {
+                    while !session.interrupt.load(std::sync::atomic::Ordering::SeqCst) {
+                        tokio::time::sleep(Duration::from_millis(40)).await;
+                    }
+                } => {
+                    {
+                        let mut v = session.view.lock().unwrap_or_else(|e| e.into_inner());
+                        for m in v.commit_pending_to_transcript() {
+                            pending.push_back(m);
+                        }
+                        // Esc path already arms "Interrupted · Enter ×2 to resume".
+                        v.mark_idle();
+                        v.arm_interrupt_resume(turn_prompt.clone());
+                    }
+                    while let Ok(action) = session.actions.try_recv() {
                         match action {
-                            Some(UserAction::Send(m)) => pending.push_back(m),
-                            Some(UserAction::LoadMoreHistory) => {
+                            UserAction::Send(m) => pending.push_back(m),
+                            UserAction::LoadMoreHistory => {
                                 let mut v =
                                     session.view.lock().unwrap_or_else(|e| e.into_inner());
                                 if let Some(arch) = v.history_archive.as_mut() {
-                                    let res = arch.load_more(LOAD_MORE_TURNS);
+                                    let res = arch.load_more(crate::tui::LOAD_MORE_TURNS);
                                     if !res.lines.is_empty() {
                                         v.apply_load_more(res.lines);
                                     } else {
@@ -649,56 +997,84 @@ impl<A: API + ConsoleWriter + 'static, F: Fn(FurcodeConfig) -> A + Send + Sync> 
                                     v.load_more_requested = false;
                                 }
                             }
-                            Some(UserAction::Interrupt) => {
-                                session.interrupt.store(true, std::sync::atomic::Ordering::SeqCst);
-                            }
-                            // Fork only while idle (after the current turn ends).
-                            Some(UserAction::ForkHistory) | Some(UserAction::ForkSelect { .. }) => {}
-                            Some(UserAction::Quit) | None => {
-                                let _ = join_session(session).await;
-                                self.print_exit_resume_hint()?;
-                                return Ok(());
-                            }
+                            UserAction::Quit => return Ok(FrameStreamOutcome::Quit),
+                            UserAction::Interrupt
+                            | UserAction::ForkHistory
+                            | UserAction::ForkSelect { .. } => {}
                         }
                     }
-                    item = stream.next() => {
-                        match item {
-                            Some(Ok(message)) => {
-                                let mut v = session.view.lock().unwrap_or_else(|e| e.into_inner());
-                                apply_chat_response(&mut v, message);
+                    return Ok(FrameStreamOutcome::Continue);
+                }
+                action = session.actions.recv() => {
+                    match action {
+                        Some(UserAction::Send(m)) => pending.push_back(m),
+                        Some(UserAction::LoadMoreHistory) => {
+                            let mut v =
+                                session.view.lock().unwrap_or_else(|e| e.into_inner());
+                            if let Some(arch) = v.history_archive.as_mut() {
+                                let res = arch.load_more(crate::tui::LOAD_MORE_TURNS);
+                                if !res.lines.is_empty() {
+                                    v.apply_load_more(res.lines);
+                                } else {
+                                    v.load_more_requested = false;
+                                }
+                            } else {
+                                v.load_more_requested = false;
                             }
-                            Some(Err(err)) => {
-                                let mut v = session.view.lock().unwrap_or_else(|e| e.into_inner());
+                        }
+                        Some(UserAction::Interrupt) => {
+                            session.interrupt.store(true, std::sync::atomic::Ordering::SeqCst);
+                        }
+                        Some(UserAction::ForkHistory) | Some(UserAction::ForkSelect { .. }) => {}
+                        Some(UserAction::Quit) | None => {
+                            return Ok(FrameStreamOutcome::Quit);
+                        }
+                    }
+                }
+                item = stream.next() => {
+                    match item {
+                        Some(Ok(message)) => {
+                            if matches!(
+                                message,
+                                ChatResponse::TaskComplete | ChatResponse::Interrupt { .. }
+                            ) {
+                                saw_terminal_reason = true;
+                            }
+                            let mut v = session.view.lock().unwrap_or_else(|e| e.into_inner());
+                            apply_chat_response(&mut v, message);
+                        }
+                        Some(Err(err)) => {
+                            let mut v = session.view.lock().unwrap_or_else(|e| e.into_inner());
+                            for line in crate::tui::error_format::format_chat_error(&err) {
+                                v.push_transcript(line);
+                            }
+                            // Errors already include a reason line from format_chat_error.
+                            for m in v.commit_pending_to_transcript() {
+                                pending.push_back(m);
+                            }
+                            v.mark_idle();
+                            return Ok(FrameStreamOutcome::Continue);
+                        }
+                        None => {
+                            let mut v = session.view.lock().unwrap_or_else(|e| e.into_inner());
+                            // Stream closed without TaskComplete/Interrupt — never silent.
+                            if !saw_terminal_reason {
                                 v.push_transcript(crate::tui::TranscriptLine {
-                                    kind: crate::tui::TranscriptKind::ToolError,
-                                    text: format!("Error: {err:#}"),
+                                    kind: crate::tui::TranscriptKind::Info,
+                                    text: "Turn ended · stream closed without a completion signal · send a message to continue"
+                                        .into(),
                                 });
-                                for m in v.commit_pending_to_transcript() {
-                                    pending.push_back(m);
-                                }
-                                v.mark_idle();
-                                break;
                             }
-                            None => {
-                                let mut v = session.view.lock().unwrap_or_else(|e| e.into_inner());
-                                // Sticky queues → real user rows (after tools), then send.
-                                for m in v.commit_pending_to_transcript() {
-                                    pending.push_back(m);
-                                }
-                                v.mark_idle();
-                                break;
+                            for m in v.commit_pending_to_transcript() {
+                                pending.push_back(m);
                             }
+                            v.mark_idle();
+                            return Ok(FrameStreamOutcome::Continue);
                         }
                     }
                 }
             }
-
-            session.interrupt.store(false, std::sync::atomic::Ordering::SeqCst);
         }
-
-        let _ = join_session(session).await;
-        self.print_exit_resume_hint()?;
-        Ok(())
     }
 
     /// Prints how to resume this session after `/exit` or Ctrl+D.
@@ -708,7 +1084,9 @@ impl<A: API + ConsoleWriter + 'static, F: Fn(FurcodeConfig) -> A + Send + Sync> 
                 let id = id.into_string();
                 self.writeln_title(
                     TitleFormat::info("Session ended")
-                        .sub_title(format!("furcode --conversation-id {id}")),
+                        .sub_title(format!(
+                            "Resume this session with:\nfurcode --conversation-id {id}"
+                        )),
                 )?;
             }
             None => {
@@ -801,7 +1179,7 @@ impl<A: API + ConsoleWriter + 'static, F: Fn(FurcodeConfig) -> A + Send + Sync> 
             let mut v = session.view.lock().unwrap_or_else(|e| e.into_inner());
             v.push_transcript(crate::tui::TranscriptLine {
                 kind: crate::tui::TranscriptKind::Info,
-                text: "No conversation yet — send a message first, then Esc Esc to undo."
+                text: "No conversation yet — send a message first, then Esc ×2 to undo."
                     .into(),
             });
             return Ok(());
@@ -1121,13 +1499,12 @@ impl<A: API + ConsoleWriter + 'static, F: Fn(FurcodeConfig) -> A + Send + Sync> 
             return self.handle_dispatch(dispatch_json).await;
         }
 
-        // Frame-based TUI scaffold (FURCODE_TUI=1). Chat stream wiring follows
-        // in the next phase; this validates layout + live composer.
-        if self.cli.is_interactive() && crate::tui::enabled() {
+        // Interactive: frame TUI only (legacy line-oriented REPL removed).
+        if self.cli.is_interactive() {
             return self.run_frame_tui().await;
         }
 
-        // Handle direct prompt or piped input if provided (raw text messages)
+        // Non-interactive one-shot: `-p` / piped prompt (spinner + live_feed path).
         let input = self.cli.prompt.clone().or(self.cli.piped_input.clone());
         if let Some(input) = input {
             tracker::prompt(input.clone());
@@ -1138,54 +1515,21 @@ impl<A: API + ConsoleWriter + 'static, F: Fn(FurcodeConfig) -> A + Send + Sync> 
             if exit {
                 return Ok(());
             }
-            // Non-interactive one-shot: do not enter the REPL.
-            if self.cli.prompt.is_some() || self.cli.piped_input.is_some() {
-                // Drain any typeahead queued during the one-shot turn.
-                while let Some(msg) = self.pending_sends.pop_front() {
-                    self.spinner.start(None)?;
-                    let msg = crate::paste::expand_image_atoms(&msg);
-                    if self
-                        .run_command_with_typeahead(AppCommand::Message(msg))
-                        .await?
-                    {
-                        return Ok(());
-                    }
-                }
-                return Ok(());
-            }
-        }
-
-        // Prompt can fail if it doesn't have access to TTY. If it fails the first
-        // time, we will stop everything and bubble up the error.
-        let mut command = self.next_command().await;
-
-        loop {
-            match command {
-                Ok(command) => {
-                    let exit = self.run_command_with_typeahead(command).await?;
-                    self.spinner.stop(None)?;
-                    if exit {
-                        return Ok(());
-                    }
-                }
-                Err(error) => {
-                    tracker::error(&error);
-                    tracing::error!(error = ?error);
-                    self.spinner.stop(None)?;
-
-                    match error.downcast::<ReadLineError>() {
-                        Ok(error) => {
-                            Err(error)?;
-                        }
-                        Err(error) => self.writeln_to_stderr(
-                            TitleFormat::error(error.to_string()).display().to_string(),
-                        )?,
-                    }
+            while let Some(msg) = self.pending_sends.pop_front() {
+                self.spinner.start(None)?;
+                let msg = crate::paste::expand_image_atoms(&msg);
+                if self
+                    .run_command_with_typeahead(AppCommand::Message(msg))
+                    .await?
+                {
+                    return Ok(());
                 }
             }
-            // Prefer queued typeahead; otherwise interactive prompt.
-            command = self.next_command().await;
+            return Ok(());
         }
+
+        // No TTY and no prompt: nothing to do.
+        Ok(())
     }
 
     // Improve startup time by hydrating caches
@@ -2875,13 +3219,13 @@ impl<A: API + ConsoleWriter + 'static, F: Fn(FurcodeConfig) -> A + Send + Sync> 
                 self.on_message(Some(content.clone())).await?;
             }
             AppCommand::Forge => {
-                self.on_agent_change(AgentId::FORGE).await?;
+                self.on_agent_change(AgentId::CODING).await?;
             }
             AppCommand::Muse => {
-                self.on_agent_change(AgentId::MUSE).await?;
+                self.on_agent_change(AgentId::PLANNING).await?;
             }
             AppCommand::Sage => {
-                self.on_agent_change(AgentId::SAGE).await?;
+                self.on_agent_change(AgentId::RESEARCHING).await?;
             }
             AppCommand::Help => {
                 let info = Info::from(self.command.as_ref());
@@ -4961,19 +5305,18 @@ impl<A: API + ConsoleWriter + 'static, F: Fn(FurcodeConfig) -> A + Send + Sync> 
                 writer.finish()?;
                 self.spinner.stop(None)?;
 
-                let title = match reason {
-                    InterruptionReason::MaxRequestPerTurnLimitReached { limit } => {
-                        format!("Maximum request ({limit}) per turn achieved")
+                self.writeln_title(TitleFormat::action(reason.user_message()))?;
+                // Only prompt auto-continue for hard limits (not followup / complete).
+                let offer_continue = matches!(
+                    reason,
+                    InterruptionReason::MaxRequestPerTurnLimitReached { .. }
+                        | InterruptionReason::MaxToolFailurePerTurnLimitReached { .. }
+                );
+                if offer_continue {
+                    let continued = self.should_continue().await?;
+                    if !continued {
+                        self.writeln_title(TitleFormat::info("Done"))?;
                     }
-                    InterruptionReason::MaxToolFailurePerTurnLimitReached { limit, .. } => {
-                        format!("Maximum tool failure limit ({limit}) reached for this turn")
-                    }
-                };
-
-                self.writeln_title(TitleFormat::action(title))?;
-                let continued = self.should_continue().await?;
-                if !continued {
-                    self.writeln_title(TitleFormat::info("Done"))?;
                 }
             }
             ChatResponse::TaskReasoning { content } => {
@@ -4987,6 +5330,9 @@ impl<A: API + ConsoleWriter + 'static, F: Fn(FurcodeConfig) -> A + Send + Sync> 
             ChatResponse::TaskComplete => {
                 feed.finish(&self.spinner)?;
                 writer.finish()?;
+                self.writeln_title(TitleFormat::info(
+                    "Turn complete · model finished (no more tools) · send a message to continue",
+                ))?;
                 if let Some(format) = self.config.auto_dump.clone() {
                     let html = matches!(format, furcode_config::AutoDumpFormat::Html);
                     self.on_dump(html).await?;

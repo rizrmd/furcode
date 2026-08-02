@@ -681,13 +681,13 @@ fn handle_key_event(
         }
         KeyEvent { code: KeyCode::Up, .. } => {
             if matched_len > 0 {
-                *selected_index = selected_index.saturating_sub(1);
+                *selected_index = (*selected_index + matched_len - 1) % matched_len;
             }
             PickerAction::Continue
         }
         KeyEvent { code: KeyCode::Down, .. } => {
             if matched_len > 0 {
-                *selected_index = cmp::min(*selected_index + 1, matched_len.saturating_sub(1));
+                *selected_index = (*selected_index + 1) % matched_len;
             }
             PickerAction::Continue
         }
@@ -1323,6 +1323,7 @@ mod tests {
     use pretty_assertions::assert_eq;
 
     use super::*;
+    use crossterm::event::KeyEventState;
 
     #[test]
     fn test_desired_select_viewport_height_right_ignores_preview_line_count() {
@@ -1370,5 +1371,117 @@ mod tests {
         let actual = bottom_preview_height(fixture.0, fixture.1, fixture.2);
         let expected = 20;
         assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn test_handle_key_event_up_wraps_to_last_item() {
+        let mut query = String::new();
+        let mut selected_index = 0usize;
+        let action = handle_key_event(
+            KeyEvent {
+                code: KeyCode::Up,
+                modifiers: KeyModifiers::NONE,
+                kind: KeyEventKind::Press,
+                state: KeyEventState::NONE,
+            },
+            &mut query,
+            3,
+            &mut selected_index,
+            false,
+        );
+        assert_eq!(action, PickerAction::Continue);
+        assert_eq!(selected_index, 2);
+    }
+
+    #[test]
+    fn test_handle_key_event_down_wraps_to_first_item() {
+        let mut query = String::new();
+        let mut selected_index = 2usize;
+        let action = handle_key_event(
+            KeyEvent {
+                code: KeyCode::Down,
+                modifiers: KeyModifiers::NONE,
+                kind: KeyEventKind::Press,
+                state: KeyEventState::NONE,
+            },
+            &mut query,
+            3,
+            &mut selected_index,
+            false,
+        );
+        assert_eq!(action, PickerAction::Continue);
+        assert_eq!(selected_index, 0);
+    }
+
+    #[test]
+    fn test_handle_key_event_up_and_down_normal_navigation() {
+        let mut query = String::new();
+        let mut selected_index = 1usize;
+
+        let action = handle_key_event(
+            KeyEvent {
+                code: KeyCode::Up,
+                modifiers: KeyModifiers::NONE,
+                kind: KeyEventKind::Press,
+                state: KeyEventState::NONE,
+            },
+            &mut query,
+            3,
+            &mut selected_index,
+            false,
+        );
+        assert_eq!(action, PickerAction::Continue);
+        assert_eq!(selected_index, 0);
+
+        let action = handle_key_event(
+            KeyEvent {
+                code: KeyCode::Down,
+                modifiers: KeyModifiers::NONE,
+                kind: KeyEventKind::Press,
+                state: KeyEventState::NONE,
+            },
+            &mut query,
+            3,
+            &mut selected_index,
+            false,
+        );
+        assert_eq!(action, PickerAction::Continue);
+        assert_eq!(selected_index, 1);
+    }
+
+    #[test]
+    fn test_handle_key_event_up_down_on_single_item() {
+        let mut query = String::new();
+        let mut selected_index = 0usize;
+
+        let action = handle_key_event(
+            KeyEvent {
+                code: KeyCode::Up,
+                modifiers: KeyModifiers::NONE,
+                kind: KeyEventKind::Press,
+                state: KeyEventState::NONE,
+            },
+            &mut query,
+            1,
+            &mut selected_index,
+            false,
+        );
+        assert_eq!(action, PickerAction::Continue);
+        assert_eq!(selected_index, 0);
+
+        let action = handle_key_event(
+            KeyEvent {
+                code: KeyCode::Down,
+                modifiers: KeyModifiers::NONE,
+                kind: KeyEventKind::Press,
+                state: KeyEventState::NONE,
+            },
+            &mut query,
+            1,
+            &mut selected_index,
+            false,
+        );
+        assert_eq!(action, PickerAction::Continue);
+        assert_eq!(selected_index, 0);
     }
 }

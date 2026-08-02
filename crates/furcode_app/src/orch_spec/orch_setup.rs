@@ -70,7 +70,7 @@ impl Default for TestContext {
                 .max_extensions(15),
             title: Some("test-conversation".into()),
             agent: Agent::new(
-                AgentId::new("forge"),
+                AgentId::new("coding"),
                 ProviderId::ANTHROPIC,
                 ModelId::new("claude-3-5-sonnet-20241022"),
             )

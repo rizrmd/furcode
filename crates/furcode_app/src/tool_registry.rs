@@ -268,7 +268,7 @@ impl<S: Services + EnvironmentInfra<Config = furcode_config::FurcodeConfig>> Too
         if !config.research_subagent {
             agents.retain(|agent| {
                 let id = agent.id.as_str();
-                id != "sage" && id != "agent"
+                id != "researching" && id != "agent"
             });
         }
 
@@ -769,11 +769,11 @@ fn create_test_agents() -> Vec<furcode_domain::Agent> {
 
     vec![
         Agent::new(
-            AgentId::new("sage"),
+            AgentId::new("researching"),
             ProviderId::ANTHROPIC,
             ModelId::new("claude-3-5-sonnet-20241022"),
         )
-        .id(AgentId::new("sage"))
+        .id(AgentId::new("researching"))
         .title("Research Agent")
         .description("Specialized in researching codebases")
         .tools(vec![

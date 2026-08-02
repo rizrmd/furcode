@@ -64,6 +64,21 @@ pub struct FurcodeCommand {
     pub value: Option<String>,
 }
 
+impl FurcodeCommand {
+    /// Whether this registered command should appear in the `/` picker and
+    /// `/help` listing.
+    ///
+    /// Dynamic `/agent-*` shortcuts stay parseable but are hidden (use
+    /// `/agent`). Workflow commands (⚙) remain visible.
+    pub fn shown_in_slash_menu(&self) -> bool {
+        // Direct agent switches: `/agent-foo` — clutter; `/agent` is enough.
+        if self.name.starts_with("agent-") {
+            return false;
+        }
+        true
+    }
+}
+
 #[derive(Debug)]
 pub struct FurcodeCommandManager {
     commands: Arc<Mutex<Vec<FurcodeCommand>>>,
@@ -96,9 +111,9 @@ impl FurcodeCommandManager {
         matches!(
             name,
             "agent"
-                | "forge"
-                | "muse"
-                | "sage"
+                | "coding"
+                | "planning"
+                | "researching"
                 | "help"
                 | "compact"
                 | "new"
@@ -249,9 +264,22 @@ impl FurcodeCommandManager {
             .cloned()
     }
 
-    /// Lists all registered commands.
+    /// Lists all registered commands (including hidden agent shortcuts).
+    ///
+    /// Prefer [`Self::list_menu`] for the interactive `/` picker and help UI.
     pub fn list(&self) -> Vec<FurcodeCommand> {
         self.commands.lock().unwrap().clone()
+    }
+
+    /// Commands shown in the slash menu / `/help` (excludes menu-hidden entries).
+    ///
+    /// Built-ins already omit `is_internal` variants at registration; this also
+    /// drops dynamic `agent-*` shortcuts so the picker stays short.
+    pub fn list_menu(&self) -> Vec<FurcodeCommand> {
+        self.list()
+            .into_iter()
+            .filter(|cmd| cmd.shown_in_slash_menu())
+            .collect()
     }
 
     /// Extracts the command value from the input parts
@@ -589,23 +617,24 @@ pub enum AppCommand {
     #[strum(props(usage = "Updates to the latest compatible version of furcode"))]
     Update,
 
-    /// Switch to the implementation agent (id: forge, alias: act).
-    /// This can be triggered with the '/act' command (alias: forge).
+    /// Switch to the coding agent.
+    /// This can be triggered with the '/act' command (alias: coding).
     #[strum(props(usage = "Enable implementation mode with code changes"))]
-    #[command(name = "act", alias = "forge")]
+    #[command(name = "act", alias = "coding")]
     Forge,
 
-    /// Switch to "muse" agent.
-    /// This can be triggered with the '/plan' command (alias: muse).
+    /// Switch to the planning agent.
+    /// This can be triggered with the '/plan' command (alias: planning).
     #[strum(props(usage = "Enable planning mode without code changes"))]
-    #[command(name = "plan", alias = "muse")]
+    #[command(name = "plan", alias = "planning")]
     Muse,
 
-    /// Switch to "sage" agent.
-    /// This can be triggered with the '/sage' command.
+    /// Switch to the researching agent.
+    /// This can be triggered with the '/research' command (alias: researching).
     #[strum(props(
         usage = "Enable research mode for systematic codebase exploration and analysis"
     ))]
+    #[command(name = "research", alias = "researching")]
     Sage,
 
     /// Switch to "help" mode.
@@ -665,7 +694,7 @@ pub enum AppCommand {
 
     /// List all conversations for the active workspace
     #[strum(props(usage = "List all conversations for the active workspace"))]
-    #[command(name = "conversation", aliases = ["conversations", "c"])]
+    #[command(name = "resume", aliases = ["resumes", "c"])]
     Conversations {
         /// Conversation ID to switch to directly (optional — shows interactive
         /// picker if absent)
@@ -730,9 +759,9 @@ impl AppCommand {
             AppCommand::Info => "info",
             AppCommand::Usage => "usage",
             AppCommand::Exit => "exit",
-            AppCommand::Forge => "forge",
-            AppCommand::Muse => "muse",
-            AppCommand::Sage => "sage",
+            AppCommand::Forge => "coding",
+            AppCommand::Muse => "planning",
+            AppCommand::Sage => "researching",
             AppCommand::Help => "help",
             AppCommand::Commit { .. } => "commit",
             AppCommand::Dump { .. } => "dump",
@@ -744,7 +773,7 @@ impl AppCommand {
             AppCommand::Login => "login",
             AppCommand::Logout => "logout",
             AppCommand::Retry => "retry",
-            AppCommand::Conversations { .. } => "conversation",
+            AppCommand::Conversations { .. } => "resume",
             AppCommand::ConversationTree => "conversation-tree",
             AppCommand::Delete => "delete",
             AppCommand::Rename { .. } => "rename",
@@ -779,23 +808,62 @@ impl AppCommand {
         self.get_str("usage").unwrap()
     }
 
-    /// Returns true for internal/meta variants that should not appear in the
-    /// public `furcode list commands` output or the REPL help listing.
+    /// Returns true for variants that should not appear in the public slash
+    /// menu, `furcode list commands`, or REPL `/help` listing.
+    ///
+    /// Hidden commands may still parse if typed explicitly (power-user / muscle
+    /// memory). The menu stays small: daily chat loop + a few high-value tools.
     pub fn is_internal(&self) -> bool {
         matches!(
             self,
+            // Meta / non-user-facing
             AppCommand::Message(_)
                 | AppCommand::Custom(_)
                 | AppCommand::Shell(_)
                 | AppCommand::AgentSwitch(_)
-                | AppCommand::Rename { .. }
+                | AppCommand::Delete
+            // Agent shorthands — use `/agent` (or type `/coding` etc. if known)
+                | AppCommand::Forge
+                | AppCommand::Muse
+                | AppCommand::Sage
+            // Config sprawl — use `/config` + CLI `furcode config …`
+                | AppCommand::ConfigModel
+                | AppCommand::ConfigReload
+                | AppCommand::ConfigReasoningEffort
+                | AppCommand::ConfigCommitModel
+                | AppCommand::ConfigSuggestModel
+                | AppCommand::ConfigEdit
+            // Cloud niche — keep `/workspace-sync` only
+                | AppCommand::Index
+                | AppCommand::WorkspaceStatus
+                | AppCommand::WorkspaceInfo
+                | AppCommand::WorkspaceInit
+            // Conversation niche / merged into `/rename` or `/conversation`
+                | AppCommand::ConversationTree
+                | AppCommand::Clone { .. }
+                | AppCommand::ConversationRename { .. }
+            // Low frequency / merged into `/commit` or unused in TUI
+                | AppCommand::CommitPreview
+                | AppCommand::Suggest { .. }
+                | AppCommand::Edit { .. }
+                | AppCommand::Activity { .. }
+                | AppCommand::Tools
+                | AppCommand::Skill
+                | AppCommand::Update
         )
     }
 
+    /// Whether this command appears in the interactive `/` picker.
+    ///
+    /// Same as `!is_internal()` for built-ins; kept for call-site clarity.
+    pub fn is_slash_menu_visible(&self) -> bool {
+        !self.is_internal()
+    }
+
     /// Returns true for variants that are pure agent-switch shorthands whose
-    /// canonical name matches a built-in agent (forge, muse, sage).  These
-    /// commands are already emitted as AGENT rows by the agent-info loop in
-    /// `on_show_commands`, so they must be excluded from the COMMAND loop to
+    /// canonical name matches a built-in agent (coding, planning, researching).
+    /// These commands are already emitted as AGENT rows by the agent-info loop
+    /// in `on_show_commands`, so they must be excluded from the COMMAND loop to
     /// avoid duplicate entries in `list commands --porcelain`.
     pub fn is_agent_switch(&self) -> bool {
         matches!(
@@ -1086,7 +1154,7 @@ mod tests {
         let cmd_manager = FurcodeCommandManager::default();
 
         // Execute
-        let result = cmd_manager.parse("/conversation").unwrap();
+        let result = cmd_manager.parse("/resume").unwrap();
 
         // Verify
         match result {
@@ -1104,7 +1172,7 @@ mod tests {
 
         // Execute
         let actual = cmd_manager
-            .parse("/conversation 550e8400-e29b-41d4-a716-446655440000")
+            .parse("/resume 550e8400-e29b-41d4-a716-446655440000")
             .unwrap();
 
         // Verify
@@ -1121,7 +1189,7 @@ mod tests {
         let commands = manager.list();
 
         // The list command should be included
-        let contains_list = commands.iter().any(|cmd| cmd.name == "conversation");
+        let contains_list = commands.iter().any(|cmd| cmd.name == "resume");
         assert!(
             contains_list,
             "Conversations command should be in default commands"
@@ -1168,8 +1236,8 @@ mod tests {
     fn test_is_reserved_command() {
         // Test reserved commands
         assert!(FurcodeCommandManager::is_reserved_command("agent"));
-        assert!(FurcodeCommandManager::is_reserved_command("forge"));
-        assert!(FurcodeCommandManager::is_reserved_command("muse"));
+        assert!(FurcodeCommandManager::is_reserved_command("coding"));
+        assert!(FurcodeCommandManager::is_reserved_command("planning"));
         assert!(!FurcodeCommandManager::is_reserved_command("agent-custom"));
         assert!(!FurcodeCommandManager::is_reserved_command("custom"));
     }
@@ -1509,6 +1577,107 @@ mod tests {
             contains_commit,
             "Commit command should be in default commands"
         );
+    }
+
+    #[test]
+    fn test_slash_menu_hides_clutter_and_keeps_core() {
+        let manager = FurcodeCommandManager::default();
+        let names: std::collections::HashSet<_> =
+            manager.list_menu().into_iter().map(|c| c.name).collect();
+
+        // Core (Tier B) — must stay visible
+        for keep in [
+            "new",
+            "compact",
+            "retry",
+            "exit",
+            "help",
+            "model",
+            "agent",
+            "reasoning-effort",
+            "conversation",
+            "rename",
+            "copy",
+            "dump",
+            "commit",
+            "config",
+            "login",
+            "logout",
+            "info",
+            "usage",
+            "workspace-sync",
+            "learn",
+        ] {
+            assert!(
+                names.contains(keep),
+                "expected /{keep} in slash menu, got {names:?}"
+            );
+        }
+
+        // Hide / merge targets — must not clutter the menu
+        for hide in [
+            "coding",
+            "planning",
+            "researching",
+            "config-model",
+            "config-reload",
+            "config-reasoning-effort",
+            "config-commit-model",
+            "config-suggest-model",
+            "config-edit",
+            "index",
+            "workspace-status",
+            "workspace-info",
+            "workspace-init",
+            "conversation-tree",
+            "clone",
+            "conversation-rename",
+            "commit-preview",
+            "suggest",
+            "edit",
+            "activity",
+            "tools",
+            "skill",
+            "update",
+            "delete",
+        ] {
+            assert!(
+                !names.contains(hide),
+                "expected /{hide} hidden from slash menu"
+            );
+        }
+
+        // Power-user: hidden commands still parse when typed.
+        let actual = manager.parse("/coding").unwrap();
+        let expected = AppCommand::Forge;
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn test_agent_shortcuts_hidden_from_slash_menu_but_parseable() {
+        let manager = FurcodeCommandManager::default();
+        let agents = vec![furcode_domain::AgentInfo::default()
+            .id("research-bot")
+            .title("Research".to_string())];
+        let _ = manager.register_agent_commands(agents);
+
+        // Registered for parse/completion of typed paths…
+        let all: Vec<_> = manager.list().into_iter().map(|c| c.name).collect();
+        assert!(
+            all.iter().any(|n| n == "agent-research-bot"),
+            "agent shortcut should be registered: {all:?}"
+        );
+
+        // …but not shown in the `/` picker.
+        let menu: Vec<_> = manager.list_menu().into_iter().map(|c| c.name).collect();
+        assert!(
+            !menu.iter().any(|n| n.starts_with("agent-")),
+            "agent-* must be hidden from menu: {menu:?}"
+        );
+
+        let actual = manager.parse("/agent-research-bot").unwrap();
+        let expected = AppCommand::AgentSwitch("research-bot".into());
+        assert_eq!(actual, expected);
     }
 
     #[test]

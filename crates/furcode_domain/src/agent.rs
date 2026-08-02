@@ -34,14 +34,14 @@ impl AgentId {
         self.0.as_ref()
     }
 
-    pub const FORGE: AgentId = AgentId(Cow::Borrowed("forge"));
-    pub const MUSE: AgentId = AgentId(Cow::Borrowed("muse"));
-    pub const SAGE: AgentId = AgentId(Cow::Borrowed("sage"));
+    pub const CODING: AgentId = AgentId(Cow::Borrowed("coding"));
+    pub const PLANNING: AgentId = AgentId(Cow::Borrowed("planning"));
+    pub const RESEARCHING: AgentId = AgentId(Cow::Borrowed("researching"));
 }
 
 impl Default for AgentId {
     fn default() -> Self {
-        AgentId::FORGE
+        AgentId::CODING
     }
 }
 

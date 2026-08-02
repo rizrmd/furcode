@@ -26,6 +26,8 @@ pub enum TranscriptKind {
     ToolError,
     /// Multi-line tool body (e.g. todo checklist) — no ● prefix.
     ToolBody,
+    /// Human-readable error detail under a [`ToolError`] title — prominent (white).
+    ErrorBody,
     Info,
     /// @deprecated mid-stream queue rows; queued prompts live in [`TurnView::pending`].
     Queued,
@@ -87,6 +89,14 @@ impl ComposerState {
         if self.cursor == 0 {
             return;
         }
+        // Whole `[Image N]` (+ trailing space) in one keystroke.
+        if let Some((start, end)) =
+            crate::paste::image_atom_for_backspace(&self.buffer, self.cursor)
+        {
+            self.buffer.replace_range(start..end, "");
+            self.cursor = start;
+            return;
+        }
         let prev = self.buffer[..self.cursor]
             .char_indices()
             .next_back()
@@ -99,6 +109,13 @@ impl ComposerState {
     /// Delete the character under the caret (forward delete).
     pub fn delete_forward(&mut self) {
         if self.cursor >= self.buffer.len() {
+            return;
+        }
+        if let Some((start, end)) =
+            crate::paste::image_atom_for_delete(&self.buffer, self.cursor)
+        {
+            self.buffer.replace_range(start..end, "");
+            self.cursor = start;
             return;
         }
         let next = self.buffer[self.cursor..]
@@ -345,21 +362,60 @@ pub struct TurnView {
     pub transcript_gen: u64,
     /// Transient status above the composer (loading / rendering markdown).
     pub status_line: Option<String>,
-    /// Slim archive of older turns (load-more + Ctrl+T overlay).
+    /// How to paint `status_line` (spinner vs static, color, spacing).
+    pub status_tone: StatusTone,
+    /// Slim archive of older turns (load-more + full-history overlay).
     pub history_archive: Option<super::history::HistoryArchive>,
-    /// Full-screen transcript overlay (Codex-style Ctrl+T).
+    /// Full-screen transcript overlay (optional; not bound to a hotkey).
     pub overlay: Option<TranscriptOverlay>,
     /// Double-Esc: pick a prior user message to fork/undo to.
     pub fork_picker: Option<ForkPicker>,
+    /// Registered slash commands for the `/` picker (host refreshes on hydrate).
+    pub command_catalog: Vec<CommandItem>,
+    /// Live `/` command menu while the composer is a bare `/query` token.
+    pub command_picker: Option<CommandPicker>,
     /// Host should load more archive turns (scroll near top).
     pub load_more_requested: bool,
     /// Active drag / completed text selection (app-side).
     pub selection: Option<TextSelection>,
     /// Plain text of the last painted selectable region (for copy).
     pub selectable: SelectablePaint,
+    /// After Esc interrupt: empty Enter ×2 re-sends this prompt (no re-print).
+    pub resume_prompt: Option<String>,
+    /// Empty Enter taps while `resume_prompt` is armed (0..=2).
+    pub resume_enter_count: u8,
+    /// Style the status line as an error/interrupt (red).
+    /// Deprecated in favor of `status_tone`; kept in sync for older call sites.
+    pub status_is_error: bool,
+    /// Last clipboard `change_token` we already announced as “Image ready”.
+    /// Avoids re-toasting the same screenshot every poll tick.
+    pub clipboard_image_token: u64,
+    /// Floating toast (e.g. "Copied") — auto-expires; drawn as overlay.
+    pub toast: Option<Toast>,
 }
 
-/// Ctrl+T overlay: browse the slim archive without bloating the main view.
+/// Brief floating notification (sonner-style).
+#[derive(Debug, Clone)]
+pub struct Toast {
+    pub text: String,
+    pub expires: Instant,
+}
+
+/// Visual treatment for the transient status row above the composer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum StatusTone {
+    /// Cyan spinner — loading / building transcript.
+    #[default]
+    Loading,
+    /// Red spinner — Esc pressed, turn still cancelling.
+    Interrupting,
+    /// Red "Interrupted", no spinner, blank lines above/below.
+    Interrupted,
+    /// Dim hint (e.g. press Enter again), no spinner, blank lines.
+    Hint,
+}
+
+/// Full-screen transcript browser (slim archive; no tool bodies).
 #[derive(Debug, Clone, Default)]
 pub struct TranscriptOverlay {
     pub lines: Vec<TranscriptLine>,
@@ -384,6 +440,71 @@ pub struct ForkPicker {
     pub selected: usize,
 }
 
+/// One slash command row for the `/` picker.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CommandItem {
+    /// Display / invoke name including leading `/` (or `!` for shell).
+    pub name: String,
+    /// Short description shown beside the name.
+    pub description: String,
+}
+
+/// Filterable slash-command menu opened while typing `/…` in the composer.
+#[derive(Debug, Clone, Default)]
+pub struct CommandPicker {
+    /// Full catalog snapshot when the menu opened.
+    pub catalog: Vec<CommandItem>,
+    /// Items matching the current composer query.
+    pub filtered: Vec<CommandItem>,
+    /// Index into `filtered`.
+    pub selected: usize,
+}
+
+impl CommandPicker {
+    /// Build a picker from a command catalog (all items visible).
+    pub fn new(catalog: Vec<CommandItem>) -> Self {
+        let filtered = catalog.clone();
+        Self {
+            catalog,
+            filtered,
+            selected: 0,
+        }
+    }
+
+    /// Re-filter by query (without leading `/`). Resets selection if needed.
+    pub fn apply_filter(&mut self, query: &str) {
+        let q = query.trim().to_ascii_lowercase();
+        if q.is_empty() {
+            self.filtered = self.catalog.clone();
+        } else {
+            self.filtered = self
+                .catalog
+                .iter()
+                .filter(|item| {
+                    let bare = item
+                        .name
+                        .trim_start_matches('/')
+                        .trim_start_matches('!')
+                        .to_ascii_lowercase();
+                    bare.contains(&q)
+                        || item.description.to_ascii_lowercase().contains(&q)
+                })
+                .cloned()
+                .collect();
+        }
+        if self.filtered.is_empty() {
+            self.selected = 0;
+        } else if self.selected >= self.filtered.len() {
+            self.selected = self.filtered.len() - 1;
+        }
+    }
+
+    /// Currently highlighted item, if any.
+    pub fn selected_item(&self) -> Option<&CommandItem> {
+        self.filtered.get(self.selected)
+    }
+}
+
 impl Default for TurnView {
     fn default() -> Self {
         Self {
@@ -404,17 +525,109 @@ impl Default for TurnView {
             jump_bottom_hit: None,
             transcript_gen: 0,
             status_line: None,
+            status_tone: StatusTone::Loading,
             history_archive: None,
             overlay: None,
             fork_picker: None,
+            command_catalog: Vec::new(),
+            command_picker: None,
             load_more_requested: false,
             selection: None,
             selectable: SelectablePaint::default(),
+            resume_prompt: None,
+            resume_enter_count: 0,
+            status_is_error: false,
+            clipboard_image_token: 0,
+            toast: None,
         }
     }
 }
 
 impl TurnView {
+    /// Wipe the interactive surface for a fresh `/new` conversation.
+    ///
+    /// Clears transcript, pending queues, history archive, overlays, status,
+    /// and scroll — keeps header chrome and the slash-command catalog.
+    pub fn reset_session_view(&mut self) {
+        self.transcript.clear();
+        self.pending.clear();
+        self.activity = ActivityPhase::Idle;
+        self.busy = false;
+        self.interrupt_requested = false;
+        self.thought_acc = Duration::ZERO;
+        self.follow_bottom = true;
+        self.viewport_end = 0;
+        self.scroll_offset = 0;
+        self.last_content_lines = 0;
+        self.last_viewport_rows = 0;
+        self.jump_bottom_hit = None;
+        self.history_archive = None;
+        self.overlay = None;
+        self.fork_picker = None;
+        self.command_picker = None;
+        self.load_more_requested = false;
+        self.selection = None;
+        self.selectable = SelectablePaint::default();
+        self.resume_prompt = None;
+        self.resume_enter_count = 0;
+        self.status_line = None;
+        self.status_tone = StatusTone::Loading;
+        self.status_is_error = false;
+        self.toast = None;
+        self.composer.clear();
+        self.touch_transcript();
+    }
+
+    /// Replace the slash-command catalog used by the `/` picker.
+    pub fn set_command_catalog(&mut self, catalog: Vec<CommandItem>) {
+        self.command_catalog = catalog;
+        // Keep an open picker in sync with the new catalog.
+        if self.command_picker.is_some() {
+            self.sync_command_picker_from_composer();
+        }
+    }
+
+    /// Open or update the `/` command menu from the composer buffer.
+    ///
+    /// The menu is active while the buffer is a bare slash token (`/`, `/he`,
+    /// `/help`) with no whitespace. A space (args) or non-`/` buffer closes it.
+    pub fn sync_command_picker_from_composer(&mut self) {
+        let buf = self.composer.buffer.as_str();
+        let Some(rest) = buf.strip_prefix('/') else {
+            if self.command_picker.take().is_some() {
+                self.touch_transcript();
+            }
+            return;
+        };
+        // Args after the command name → close menu.
+        if rest.chars().any(|c| c.is_whitespace()) {
+            if self.command_picker.take().is_some() {
+                self.touch_transcript();
+            }
+            return;
+        }
+        if self.command_catalog.is_empty() {
+            return;
+        }
+        if self.command_picker.is_none() {
+            self.command_picker = Some(CommandPicker::new(self.command_catalog.clone()));
+        }
+        if let Some(picker) = self.command_picker.as_mut() {
+            // Re-seed catalog if host refreshed it while open.
+            if picker.catalog.len() != self.command_catalog.len() {
+                picker.catalog = self.command_catalog.clone();
+            }
+            picker.apply_filter(rest);
+        }
+        self.touch_transcript();
+    }
+
+    /// Whether the composer currently holds a slash or shell command line.
+    pub fn composer_is_slash_command(text: &str) -> bool {
+        let t = text.trim_start();
+        t.starts_with('/') || t.starts_with('!')
+    }
+
     /// Begin a drag selection at a terminal cell.
     pub fn selection_begin(&mut self, col: u16, row: u16) {
         let pos = CellPos { col, row };
@@ -456,6 +669,118 @@ impl TurnView {
     pub fn clear_selection(&mut self) {
         if self.selection.take().is_some() {
             self.touch_transcript();
+        }
+    }
+
+    /// Show a floating toast for `ttl` (default ~1.8s if used via helpers).
+    pub fn show_toast(&mut self, text: impl Into<String>, ttl: Duration) {
+        self.toast = Some(Toast {
+            text: text.into(),
+            expires: Instant::now() + ttl,
+        });
+        self.touch_transcript();
+    }
+
+    /// Toast after a successful clipboard copy.
+    pub fn toast_copied(&mut self, text: &str) {
+        let lines = text.lines().count().max(1);
+        let chars = text.chars().count();
+        let msg = if lines > 1 {
+            format!("Copied · {lines} lines")
+        } else if chars > 40 {
+            format!("Copied · {chars} chars")
+        } else {
+            "Copied".into()
+        };
+        self.show_toast(msg, Duration::from_millis(1800));
+    }
+
+    /// Toast after a clipboard image was saved and attached as `[Image N]`.
+    pub fn toast_image_attached(&mut self, atom: &str) {
+        self.show_toast(
+            format!("Image attached · {atom}"),
+            Duration::from_millis(2200),
+        );
+    }
+
+    /// Toast when a screenshot lands on the clipboard (before the user pastes).
+    pub fn toast_image_available(&mut self) {
+        self.show_toast(
+            "Image ready · Ctrl+V to paste",
+            Duration::from_millis(3200),
+        );
+    }
+
+    /// Poll the system clipboard; toast once per pasteboard generation when an
+    /// image is ready (terminals often swallow Cmd+V for image-only content).
+    pub fn poll_clipboard_image_hint(&mut self) {
+        let probe = crate::paste::probe_clipboard();
+        if !probe.image_ready_to_paste() {
+            // Clear token only when image is gone so a new copy re-toasts.
+            if !probe.has_image {
+                self.clipboard_image_token = 0;
+            }
+            return;
+        }
+        if probe.change_token == 0 || probe.change_token == self.clipboard_image_token {
+            return;
+        }
+        self.clipboard_image_token = probe.change_token;
+        self.toast_image_available();
+    }
+
+    /// Try clipboard image paste into the composer.
+    ///
+    /// On success inserts `[Image N] ` and toasts. Returns `true` so callers
+    /// skip text paste (and discard empty/garbage paste bodies).
+    /// Missing image content returns `false`. Hard clipboard failures toast and
+    /// return `false` so a non-empty text paste can still proceed.
+    pub fn try_paste_clipboard_image(&mut self, prefer_image: bool) -> bool {
+        use crate::paste::ImagePasteMode;
+        let mode = if prefer_image {
+            ImagePasteMode::PreferImage
+        } else {
+            ImagePasteMode::PreferText
+        };
+        match crate::paste::try_paste_clipboard_image_with(mode) {
+            Ok(Some(atom)) => {
+                self.composer.insert_str(&format!("{atom} "));
+                // Consumed — don't re-toast "available" for the same token.
+                let probe = crate::paste::probe_clipboard();
+                if probe.change_token != 0 {
+                    self.clipboard_image_token = probe.change_token;
+                }
+                self.toast_image_attached(&atom);
+                true
+            }
+            Ok(None) => false,
+            Err(err) => {
+                let brief = err
+                    .chain()
+                    .next()
+                    .map(|e| e.to_string())
+                    .unwrap_or_else(|| err.to_string());
+                let short: String = brief.chars().take(60).collect();
+                self.show_toast(
+                    format!("Image paste failed · {short}"),
+                    Duration::from_millis(2800),
+                );
+                false
+            }
+        }
+    }
+
+    /// Drop toast when past `expires`. Returns true if still visible.
+    pub fn toast_active(&mut self) -> bool {
+        let Some(t) = self.toast.as_ref() else {
+            return false;
+        };
+        if Instant::now() >= t.expires {
+            self.toast = None;
+            self.touch_transcript();
+            false
+        } else {
+            true
         }
     }
 
@@ -512,9 +837,22 @@ impl TurnView {
 }
 
 impl TurnView {
-    /// Show a status line above the composer (spinner drawn by the renderer).
+    /// Show a status line above the composer (cyan spinner by default).
     pub fn set_status(&mut self, msg: impl Into<String>) {
+        self.set_status_with(StatusTone::Loading, msg);
+    }
+
+    /// Status line in red with spinner (e.g. "Interrupting…").
+    pub fn set_status_error(&mut self, msg: impl Into<String>) {
+        self.set_status_with(StatusTone::Interrupting, msg);
+    }
+
+    /// Status with explicit visual tone.
+    pub fn set_status_with(&mut self, tone: StatusTone, msg: impl Into<String>) {
         self.status_line = Some(msg.into());
+        self.status_tone = tone;
+        self.status_is_error =
+            matches!(tone, StatusTone::Interrupting | StatusTone::Interrupted);
         // Bump so the draw loop repaints (it only animates while status is set;
         // without a gen bump, clearing status would leave the last frame stuck).
         self.touch_transcript();
@@ -522,10 +860,12 @@ impl TurnView {
 
     /// Clear the transient status line.
     pub fn clear_status(&mut self) {
-        if self.status_line.is_none() {
+        if self.status_line.is_none() && !self.status_is_error {
             return;
         }
         self.status_line = None;
+        self.status_tone = StatusTone::Loading;
+        self.status_is_error = false;
         self.touch_transcript();
     }
 
@@ -657,6 +997,8 @@ impl TurnView {
 
     /// Start a thinking phase (or no-op if already thinking).
     pub fn begin_thinking(&mut self) {
+        // New turn activity replaces interrupt chrome.
+        self.disarm_interrupt_resume();
         if !matches!(self.activity, ActivityPhase::Thinking { .. }) {
             self.activity = ActivityPhase::Thinking {
                 started: Instant::now(),
@@ -737,6 +1079,7 @@ impl TurnView {
     }
 
     pub fn begin_tool(&mut self, label: impl Into<String>) {
+        self.disarm_interrupt_resume();
         self.flush_thought();
         self.activity = ActivityPhase::Tool {
             started: Instant::now(),
@@ -805,7 +1148,11 @@ impl TurnView {
             });
             for line in body_lines {
                 self.transcript.push(TranscriptLine {
-                    kind: TranscriptKind::ToolBody,
+                    kind: if is_error {
+                        TranscriptKind::ErrorBody
+                    } else {
+                        TranscriptKind::ToolBody
+                    },
                     text: line,
                 });
             }
@@ -1005,12 +1352,33 @@ impl TurnView {
     }
 
     /// Enter while idle: return message to send. While busy: queue it sticky.
+    ///
+    /// After an interrupt, empty Enter ×2 resumes the last prompt without
+    /// re-printing it in the transcript.
     pub fn submit_composer(&mut self) -> Option<String> {
         let text = self.composer.take();
         let trimmed = text.trim();
         if trimmed.is_empty() {
+            if self.busy {
+                return None;
+            }
+            // Resume path: Enter, Enter on empty composer after interrupt.
+            if self.resume_prompt.is_some() {
+                self.resume_enter_count = self.resume_enter_count.saturating_add(1);
+                if self.resume_enter_count >= 2 {
+                    let prompt = self.resume_prompt.take().unwrap_or_default();
+                    self.resume_enter_count = 0;
+                    self.clear_status();
+                    // Do not push_user — the original user turn is still in history.
+                    return Some(prompt);
+                }
+                self.set_status_with(StatusTone::Hint, "Press Enter again to resume");
+                return None;
+            }
             return None;
         }
+        // New prompt cancels resume arming and the Interrupted status chrome.
+        self.disarm_interrupt_resume();
         let owned = trimmed.to_string();
         if self.busy {
             // Sticky pending panel — do NOT insert into the live tool transcript.
@@ -1024,6 +1392,37 @@ impl TurnView {
             self.push_user(owned.clone());
             Some(owned)
         }
+    }
+
+    /// Drop Enter×2 resume arming and clear Interrupted / resume-hint status.
+    ///
+    /// Call when the user starts a new message or a new turn begins so Thinking
+    /// is not covered by the leftover "Interrupted · Enter ×2 to resume" row.
+    pub fn disarm_interrupt_resume(&mut self) {
+        self.resume_prompt = None;
+        self.resume_enter_count = 0;
+        if matches!(
+            self.status_tone,
+            StatusTone::Interrupted | StatusTone::Hint
+        ) || self
+            .status_line
+            .as_deref()
+            .is_some_and(|s| s.contains("Interrupted") || s.contains("Press Enter again"))
+        {
+            self.clear_status();
+        }
+    }
+
+    /// Arm double-Enter resume after a successful Esc interrupt.
+    pub fn arm_interrupt_resume(&mut self, last_user_prompt: String) {
+        if last_user_prompt.trim().is_empty() {
+            self.disarm_interrupt_resume();
+            return;
+        }
+        self.resume_prompt = Some(last_user_prompt);
+        self.resume_enter_count = 0;
+        // Red static line, no spinner, blank-line padded (see render).
+        self.set_status_with(StatusTone::Interrupted, "Interrupted · Enter ×2 to resume");
     }
 
     /// Move sticky pending prompts into the transcript as real user rows.
@@ -1048,10 +1447,8 @@ impl TurnView {
     pub fn request_interrupt(&mut self) {
         if self.busy {
             self.interrupt_requested = true;
-            self.push_transcript(TranscriptLine {
-                kind: TranscriptKind::Info,
-                text: "Interrupt requested".into(),
-            });
+            // Quiet UX: red spinner only — no transcript spam.
+            self.set_status_with(StatusTone::Interrupting, "Interrupting…");
         }
     }
 
@@ -1061,6 +1458,10 @@ impl TurnView {
         self.busy = false;
         self.interrupt_requested = false;
         self.thought_acc = Duration::ZERO;
+        // Keep resume/hint status if armed; clear Interrupting spinner otherwise.
+        if self.resume_prompt.is_none() && self.status_tone == StatusTone::Interrupting {
+            self.clear_status();
+        }
         self.touch_transcript();
     }
 }
@@ -1279,9 +1680,11 @@ fn collapsed_tool_label(family: &str, n: usize) -> String {
     }
 }
 
-/// Push a tool summary, merging into the previous row when the family matches.
+/// Push a tool summary, merging into the same family in the trailing tool block.
 ///
-/// Returns `true` when the new call was folded into an existing line.
+/// Look-back (not only the immediate previous row) so interleaved
+/// `Read → Shell → Search → Shell` becomes three summary lines instead of a
+/// wall of alternating detail rows.
 pub fn push_or_collapse_tool(lines: &mut Vec<TranscriptLine>, text: String, is_error: bool) {
     if is_error {
         lines.push(TranscriptLine {
@@ -1293,7 +1696,7 @@ pub fn push_or_collapse_tool(lines: &mut Vec<TranscriptLine>, text: String, is_e
     let Some(family) = tool_family(&text) else {
         lines.push(TranscriptLine {
             kind: TranscriptKind::ToolDone,
-            text,
+            text: short_tool_label(&text),
         });
         return;
     };
@@ -1301,25 +1704,58 @@ pub fn push_or_collapse_tool(lines: &mut Vec<TranscriptLine>, text: String, is_e
     if matches!(family, "ReadTodos") {
         lines.push(TranscriptLine {
             kind: TranscriptKind::ToolDone,
-            text,
+            text: short_tool_label(&text),
         });
         return;
     }
 
-    if let Some(last) = lines.last_mut()
-        && last.kind == TranscriptKind::ToolDone
-        && tool_family(&last.text) == Some(family)
-    {
-        let prev_n = tool_group_count(family, &last.text);
+    // Walk the trailing run of successful tool rows only (stop at user /
+    // assistant / error / body / spacer). Merge into the last same-family line.
+    for i in (0..lines.len()).rev() {
+        let kind = lines[i].kind;
+        if kind != TranscriptKind::ToolDone {
+            break;
+        }
+        if tool_family(&lines[i].text) != Some(family) {
+            continue;
+        }
+        let prev_n = tool_group_count(family, &lines[i].text);
         let this_n = tool_group_count(family, &text);
-        last.text = collapsed_tool_label(family, prev_n + this_n);
+        lines[i].text = collapsed_tool_label(family, prev_n + this_n);
         return;
     }
 
+    // First of this family in the block — prefer a compact label (no 0.1s noise).
     lines.push(TranscriptLine {
         kind: TranscriptKind::ToolDone,
-        text,
+        text: short_tool_label(&text),
     });
+}
+
+/// Drop tiny elapsed suffixes and overlong paths so a single tool row stays calm.
+fn short_tool_label(text: &str) -> String {
+    let mut s = text.to_string();
+    // Strip " · 0.1s" / " · 1.2s" — live activity already showed timing.
+    if let Some((head, tail)) = s.rsplit_once(" · ") {
+        let t = tail.trim();
+        if t.ends_with('s')
+            && t.len() <= 8
+            && t.chars()
+                .filter(|c| c.is_ascii_digit() || *c == '.' || *c == 's' || *c == 'm')
+                .count()
+                == t.chars().count()
+        {
+            s = head.to_string();
+        }
+    }
+    // Soft-cap long search/shell titles.
+    const MAX: usize = 72;
+    if s.chars().count() > MAX {
+        let t: String = s.chars().take(MAX.saturating_sub(1)).collect();
+        format!("{t}…")
+    } else {
+        s
+    }
 }
 
 impl TurnView {
@@ -1389,6 +1825,32 @@ mod tests {
         assert_eq!(c.buffer, "hello ");
         c.insert_str("bar\nbaz");
         assert_eq!(c.buffer, "hello bar baz");
+    }
+
+    #[test]
+    fn test_composer_image_atom_backspace_is_atomic() {
+        let mut c = ComposerState::default();
+        c.insert_str("see [Image 1] please");
+        c.move_end();
+        // Cursor after "please" — normal backspace still char-wise.
+        c.backspace();
+        assert_eq!(c.buffer, "see [Image 1] pleas");
+        // Place cursor just after the atom's trailing space region: after `]`.
+        c.buffer = "see [Image 1] ".into();
+        c.cursor = c.buffer.len();
+        c.backspace();
+        assert_eq!(c.buffer, "see ");
+        assert_eq!(c.cursor, 4);
+    }
+
+    #[test]
+    fn test_composer_image_atom_delete_forward_is_atomic() {
+        let mut c = ComposerState::default();
+        c.insert_str("[Image 2] more");
+        c.cursor = 0;
+        c.delete_forward();
+        assert_eq!(c.buffer, "more");
+        assert_eq!(c.cursor, 0);
     }
 
     #[test]
@@ -1581,14 +2043,34 @@ mod tests {
         push_or_collapse_tool(&mut lines, "Read c.rs · 0.1s".into(), false);
         push_or_collapse_tool(&mut lines, "Shell cargo test · 1.0s".into(), false);
         let texts: Vec<_> = lines.iter().map(|l| l.text.as_str()).collect();
+        // Look-back merges non-adjacent same-family tools in the trailing block.
         assert_eq!(
             texts,
             vec![
-                "Read 2 files",
+                "Read 3 files",
                 "Search 2 times",
-                "Read c.rs · 0.1s",
-                "Shell cargo test · 1.0s",
+                "Shell cargo test", // elapsed stripped for quiet summaries
             ]
+        );
+    }
+
+    #[test]
+    fn test_interleaved_tools_collapse_lookback() {
+        // Pattern from real sessions: Read / Shell / Search alternating.
+        let mut lines = Vec::new();
+        for _ in 0..3 {
+            push_or_collapse_tool(&mut lines, "Read a.rs · 0.1s".into(), false);
+            push_or_collapse_tool(&mut lines, "Shell ls · 0.1s".into(), false);
+            push_or_collapse_tool(
+                &mut lines,
+                "Search for 'x' at . · 0.1s".into(),
+                false,
+            );
+        }
+        let texts: Vec<_> = lines.iter().map(|l| l.text.as_str()).collect();
+        assert_eq!(
+            texts,
+            vec!["Read 3 files", "Shell 3 commands", "Search 3 times"]
         );
     }
 
@@ -1715,5 +2197,81 @@ mod tests {
         assert!(hit.contains(29, 5));
         assert!(!hit.contains(30, 5));
         assert!(!hit.contains(15, 6));
+    }
+
+    #[test]
+    fn test_command_picker_filters_by_name() {
+        let catalog = vec![
+            CommandItem {
+                name: "/help".into(),
+                description: "Show help".into(),
+            },
+            CommandItem {
+                name: "/new".into(),
+                description: "Start a new conversation".into(),
+            },
+            CommandItem {
+                name: "/agent".into(),
+                description: "Switch agent".into(),
+            },
+        ];
+        let mut picker = CommandPicker::new(catalog);
+        picker.apply_filter("he");
+        let actual: Vec<_> = picker.filtered.iter().map(|c| c.name.as_str()).collect();
+        let expected = vec!["/help"];
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn test_sync_command_picker_opens_on_slash() {
+        let mut view = TurnView::default();
+        view.command_catalog = vec![CommandItem {
+            name: "/help".into(),
+            description: "Show help".into(),
+        }];
+        view.composer.insert_char('/');
+        view.sync_command_picker_from_composer();
+        assert!(view.command_picker.is_some());
+        view.composer.insert_str("help more");
+        view.sync_command_picker_from_composer();
+        assert!(view.command_picker.is_none());
+    }
+
+    #[test]
+    fn test_composer_is_slash_command() {
+        assert!(TurnView::composer_is_slash_command("/help"));
+        assert!(TurnView::composer_is_slash_command("  /new"));
+        assert!(TurnView::composer_is_slash_command("!ls"));
+        assert!(!TurnView::composer_is_slash_command("hello"));
+    }
+
+    #[test]
+    fn test_reset_session_view_clears_transcript() {
+        let mut view = TurnView::default();
+        view.push_user("hello");
+        view.push_assistant("world");
+        view.pending.push(PendingPrompt {
+            text: "queued".into(),
+            time: "12:00".into(),
+        });
+        view.busy = true;
+        view.follow_bottom = false;
+        view.viewport_end = 10;
+        view.composer.insert_str("/new");
+        view.command_picker = Some(CommandPicker::new(vec![CommandItem {
+            name: "/new".into(),
+            description: "Start a new conversation".into(),
+        }]));
+
+        view.reset_session_view();
+
+        assert!(view.transcript.is_empty());
+        assert!(view.pending.is_empty());
+        assert!(view.history_archive.is_none());
+        assert!(view.command_picker.is_none());
+        assert!(!view.busy);
+        assert!(view.composer.buffer.is_empty());
+        assert!(view.follow_bottom);
+        assert_eq!(view.viewport_end, 0);
     }
 }

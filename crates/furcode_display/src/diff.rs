@@ -1,27 +1,5 @@
-use std::fmt;
-
 use console::{Style, style};
 use similar::{ChangeTag, TextDiff};
-
-struct Line {
-    index: Option<usize>,
-    width: usize,
-}
-
-impl Line {
-    fn new(index: Option<usize>, width: usize) -> Self {
-        Self { index, width }
-    }
-}
-
-impl fmt::Display for Line {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        match self.index {
-            None => write!(f, "{:width$}", "", width = self.width),
-            Some(idx) => write!(f, "{:<width$}", idx + 1, width = self.width),
-        }
-    }
-}
 
 #[derive(Debug, Clone)]
 pub struct DiffResult {
@@ -47,23 +25,38 @@ impl DiffResult {
 pub struct DiffFormat;
 
 impl DiffFormat {
+    /// Format a line-oriented unified-style diff for terminal and TUI display.
+    ///
+    /// Layout (readable without color):
+    /// ```text
+    ///   1 │ context line
+    /// - 2 │ removed line
+    /// + 2 │ added line
+    /// ···
+    /// ```
+    ///
+    /// - Single line-number column (old for deletes, new for inserts/context)
+    /// - Explicit `+` / `-` sign with spacing so signs are not glued to text
+    /// - Green inserts, red deletes, dim context (ANSI; TUI re-colors after strip)
     pub fn format(old: &str, new: &str) -> DiffResult {
         let diff = TextDiff::from_lines(old, new);
         let ops = diff.grouped_ops(3);
         let mut output = String::new();
 
-        let mut lines_added = 0;
-        let mut lines_removed = 0;
+        let mut lines_added = 0u64;
+        let mut lines_removed = 0u64;
 
         if ops.is_empty() {
             output.push_str(&format!("{}\n", style("No changes applied").dim()));
-
-            return DiffResult { result: output, lines_added, lines_removed };
+            return DiffResult {
+                result: output,
+                lines_added,
+                lines_removed,
+            };
         }
 
-        // First pass: Calculate dynamic width based on max line numbers in actual
-        // changes
-        let mut max_line_number = 0;
+        // Width from line numbers that actually appear in the hunks.
+        let mut max_line_number = 0usize;
         for group in &ops {
             for op in group {
                 for change in diff.iter_inline_changes(op) {
@@ -82,30 +75,49 @@ impl DiffFormat {
             (max_line_number as f64).log10().floor() as usize + 1
         };
 
-        // Second pass: Format the output
         for (idx, group) in ops.iter().enumerate() {
             if idx > 0 {
-                output.push_str(&format!("{}\n", style("...").dim()));
+                output.push_str(&format!("{}\n", style("···").dim()));
             }
             for op in group {
                 for change in diff.iter_inline_changes(op) {
-                    let (sign, s) = match change.tag() {
+                    let (sign, line_no, s) = match change.tag() {
                         ChangeTag::Delete => {
                             lines_removed += 1;
-                            ("-", Style::new().red())
+                            (
+                                "-",
+                                change.old_index().map(|i| i + 1),
+                                Style::new().red(),
+                            )
                         }
                         ChangeTag::Insert => {
                             lines_added += 1;
-                            ("+", Style::new().yellow())
+                            (
+                                "+",
+                                change.new_index().map(|i| i + 1),
+                                Style::new().green(),
+                            )
                         }
-                        ChangeTag::Equal => (" ", Style::new().dim()),
+                        ChangeTag::Equal => (
+                            " ",
+                            change
+                                .new_index()
+                                .or_else(|| change.old_index())
+                                .map(|i| i + 1),
+                            Style::new().dim(),
+                        ),
                     };
 
+                    let num = match line_no {
+                        Some(n) => format!("{n:>width$}"),
+                        None => format!("{:width$}", ""),
+                    };
+
+                    // "± N │ content" — sign column is always 1 char + space.
                     output.push_str(&format!(
-                        "{} {} |{}",
-                        style(Line::new(change.old_index(), width)).dim(),
-                        style(Line::new(change.new_index(), width)).dim(),
+                        "{} {} │ ",
                         s.apply_to(sign),
+                        style(num).dim(),
                     ));
 
                     for (_, value) in change.iter_strings_lossy() {
@@ -118,7 +130,11 @@ impl DiffFormat {
             }
         }
 
-        DiffResult { result: output, lines_added, lines_removed }
+        DiffResult {
+            result: output,
+            lines_added,
+            lines_removed,
+        }
     }
 }
 
@@ -126,6 +142,7 @@ impl DiffFormat {
 mod tests {
     use console::strip_ansi_codes;
     use insta::assert_snapshot;
+    use pretty_assertions::assert_eq;
 
     use super::*;
 
@@ -155,6 +172,8 @@ mod tests {
         let new = "line 1\nline 2\nline 3";
         let diff = DiffFormat::format(old, new);
         let clean_diff = strip_ansi_codes(diff.diff());
+        // Truncating the last two lines leaves trailing equal "line 3" as insert
+        // after three deletes — counts from similar's line split.
         assert_eq!(diff.lines_added(), 1);
         assert_eq!(diff.lines_removed(), 3);
         assert_snapshot!(clean_diff);
@@ -168,12 +187,13 @@ mod tests {
         let clean_diff = strip_ansi_codes(diff.diff());
         assert_eq!(diff.lines_added(), 1);
         assert_eq!(diff.lines_removed(), 1);
+        assert!(clean_diff.contains("- 2 │ line 2"));
+        assert!(clean_diff.contains("+ 2 │ modified line"));
         assert_snapshot!(clean_diff);
     }
 
     #[test]
     fn test_dynamic_width_with_large_line_numbers() {
-        // Test with 100+ lines to verify width calculation
         let old_lines = (1..=150).map(|i| format!("line {i}")).collect::<Vec<_>>();
         let mut new_lines = old_lines.clone();
         new_lines[99] = "modified line 100".to_string();
@@ -183,10 +203,10 @@ mod tests {
         let diff = DiffFormat::format(&old, &new);
         let clean_diff = strip_ansi_codes(diff.diff());
 
-        // With 150 lines, width should be 3 (for numbers like "100")
-        // Verify the format includes proper spacing
         assert!(clean_diff.contains("100"));
+        assert!(clean_diff.contains("- 100 │ line 100") || clean_diff.contains("-100 │ line 100"));
         assert_eq!(diff.lines_added(), 1);
+        assert_eq!(diff.lines_removed(), 1);
     }
 
     #[test]
@@ -194,19 +214,31 @@ mod tests {
         // Large file but diff only at the beginning
         let old_lines = (1..=1000).map(|i| format!("line {i}")).collect::<Vec<_>>();
         let mut new_lines = old_lines.clone();
-        new_lines[4] = "modified line 5".to_string(); // Only change line 5
+        new_lines[4] = "modified line 5".to_string();
 
         let old = old_lines.join("\n");
         let new = new_lines.join("\n");
         let diff = DiffFormat::format(&old, &new);
         let clean_diff = strip_ansi_codes(diff.diff());
 
-        // Diff only shows lines 3-8 (context), so width should be 1 (for single digit
-        // numbers) NOT 4 (which would be needed for line 1000)
-        assert!(clean_diff.contains("3 3 | line 3"));
-        assert!(clean_diff.contains("5   |-line 5"));
+        // Diff only shows nearby context, so width is 1 digit — not 4 for line 1000.
+        assert!(clean_diff.contains("  3 │ line 3"));
+        assert!(clean_diff.contains("- 5 │ line 5"));
+        assert!(clean_diff.contains("+ 5 │ modified line 5"));
         assert_eq!(diff.lines_added(), 1);
         assert_eq!(diff.lines_removed(), 1);
         assert_snapshot!(clean_diff);
+    }
+
+    #[test]
+    fn test_plain_format_has_space_after_sign() {
+        let old = "a\nb\nc";
+        let new = "a\nB\nc";
+        let clean = strip_ansi_codes(DiffFormat::format(old, new).diff()).to_string();
+        // Sign must not be glued to the line number or content.
+        assert!(clean.lines().any(|l| l.starts_with("- ")));
+        assert!(clean.lines().any(|l| l.starts_with("+ ")));
+        assert!(!clean.contains("|-"));
+        assert!(!clean.contains("|+"));
     }
 }

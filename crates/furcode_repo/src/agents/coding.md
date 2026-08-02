@@ -1,5 +1,5 @@
 ---
-id: "forge"
+id: "coding"
 title: "Perform technical development tasks"
 description: "Hands-on implementation agent that executes software development tasks through direct code modifications, file operations, and system commands. Specializes in building features, fixing bugs, refactoring code, running tests, and making concrete changes to codebases. Uses structured approach: analyze requirements, implement solutions, validate through compilation and testing. Ideal for tasks requiring actual modifications rather than analysis. Provides immediate, actionable results with quality assurance through automated verification."
 reasoning:
@@ -139,7 +139,7 @@ Choose tools based on the nature of the task. Tools are **native function calls*
 {{#if tool_names.task}}- If the user specifies that they want you to run tools "in parallel", you MUST send a single message with multiple tool use content blocks. For example, if you need to launch multiple agents in parallel, send a single message with multiple {{tool_names.task}} tool calls.{{/if}}
 - Use specialized tools instead of shell commands when possible. For file operations, use dedicated tools: {{tool_names.read}} for reading files instead of cat/head/tail, {{tool_names.patch}} for editing instead of sed/awk, and {{tool_names.write}} for creating files instead of echo redirection. Reserve {{tool_names.shell}} exclusively for actual system commands and terminal operations that require shell execution.
 {{#if tool_names.task}}- When NOT to use the {{tool_names.task}} tool: Do NOT launch a sub-agent for initial codebase exploration or simple lookups. Always use semantic search directly first.{{/if}}
-{{#if tool_names.sage}}- Use the {{tool_names.sage}} tool for deep research tasks that require comprehensive, read-only investigation across multiple files. Do NOT use it for code modifications — choose direct tools instead.{{/if}}
+{{#if tool_names.researching}}- Use the {{tool_names.researching}} tool for deep research tasks that require comprehensive, read-only investigation across multiple files. Do NOT use it for code modifications — choose direct tools instead.{{/if}}
 
 ### Wrong (never emit as text — not executed)
 

@@ -13,10 +13,11 @@ use ratatui::layout::{Constraint, Direction, Layout, Position, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
+use unicode_width::UnicodeWidthChar;
 
 use super::view::{
-    ActivityPhase, HitRect, SelectablePaint, TextSelection, TranscriptKind, TranscriptLine,
-    TurnView,
+    ActivityPhase, HitRect, SelectablePaint, StatusTone, TextSelection, TranscriptKind,
+    TranscriptLine, TurnView,
 };
 
 const SPINNER: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
@@ -83,10 +84,30 @@ thread_local! {
 
 // ─── Layout ─────────────────────────────────────────────────────────────────
 
+/// "Interrupted" bright red; resume hint white. No spinner glyph.
+fn interrupted_status_line(status: &str) -> Line<'static> {
+    const PREFIX: &str = "Interrupted";
+    // Bright red so it cannot read as gray on dark themes.
+    let red = Style::default()
+        .fg(Color::Rgb(255, 85, 85))
+        .add_modifier(Modifier::BOLD);
+    if let Some(rest) = status.strip_prefix(PREFIX) {
+        return Line::from(vec![
+            Span::styled(PREFIX.to_string(), red),
+            Span::styled(rest.to_string(), Style::default().fg(Color::White)),
+        ]);
+    }
+    Line::from(Span::styled(status.to_string(), red))
+}
+
 fn activity_row_count(view: &TurnView) -> u16 {
     const MAX_PREVIEW: usize = 2;
     if view.status_line.is_some() {
-        return 1;
+        // blank + status + blank so the line is not flush against transcript/composer
+        match view.status_tone {
+            StatusTone::Interrupted | StatusTone::Hint => return 3,
+            StatusTone::Loading | StatusTone::Interrupting => return 1,
+        }
     }
     match &view.activity {
         ActivityPhase::Idle => u16::from(view.busy),
@@ -116,6 +137,7 @@ pub fn draw(frame: &mut Frame, view: &mut TurnView, tick: u64) {
 
     let activity_h = activity_row_count(view);
     let pending_h = pending_row_count(view);
+    let menu_h = command_menu_row_count(view, area.height);
     // Grow with soft-wrapped input; leave room for header/footer/activity.
     let composer_h = composer_row_count(&view.composer.buffer, area.width);
     let chunks = Layout::default()
@@ -125,6 +147,7 @@ pub fn draw(frame: &mut Frame, view: &mut TurnView, tick: u64) {
             Constraint::Min(3),                    // scrollable transcript
             Constraint::Length(pending_h),         // sticky queued prompts
             Constraint::Length(activity_h),        // live activity
+            Constraint::Length(menu_h),            // slash command menu
             Constraint::Length(composer_h),        // multi-line composer
             Constraint::Length(1),                 // footer
         ])
@@ -138,8 +161,177 @@ pub fn draw(frame: &mut Frame, view: &mut TurnView, tick: u64) {
     if activity_h > 0 {
         draw_activity(frame, chunks[3], view, tick);
     }
-    draw_composer(frame, chunks[4], view);
-    draw_footer(frame, chunks[5], view);
+    if menu_h > 0 {
+        draw_command_menu(frame, chunks[4], view);
+    }
+    draw_composer(frame, chunks[5], view);
+    draw_footer(frame, chunks[6], view);
+    // Sonner-style pill (overlay; does not steal layout rows).
+    draw_toast(frame, area, view);
+}
+
+/// Rows reserved for the slash-command menu (0 when closed).
+fn command_menu_row_count(view: &TurnView, term_height: u16) -> u16 {
+    let Some(picker) = view.command_picker.as_ref() else {
+        return 0;
+    };
+    // header + items (capped) + blank separator feel
+    let items = picker.filtered.len().min(10).max(1) as u16;
+    let want = 1 + items; // title row + list
+    // Leave room for header/composer/footer (~5) and a bit of transcript.
+    let max = term_height.saturating_sub(8).max(3);
+    want.min(max)
+}
+
+fn draw_command_menu(frame: &mut Frame, area: Rect, view: &TurnView) {
+    let Some(picker) = view.command_picker.as_ref() else {
+        return;
+    };
+    if area.height == 0 {
+        return;
+    }
+
+    let title_style = Style::default()
+        .fg(Color::Black)
+        .bg(Color::Cyan)
+        .add_modifier(Modifier::BOLD);
+    frame.render_widget(
+        Paragraph::new(Span::styled(
+            " Commands · ↑↓ select · Enter run · Esc dismiss ",
+            title_style,
+        )),
+        Rect {
+            x: area.x,
+            y: area.y,
+            width: area.width,
+            height: 1,
+        },
+    );
+
+    if area.height < 2 {
+        return;
+    }
+
+    let list_h = (area.height - 1) as usize;
+    let n = picker.filtered.len();
+    if n == 0 {
+        frame.render_widget(
+            Paragraph::new(Span::styled(
+                "  (no matches)",
+                Style::default().fg(Color::DarkGray),
+            )),
+            Rect {
+                x: area.x,
+                y: area.y + 1,
+                width: area.width,
+                height: 1,
+            },
+        );
+        return;
+    }
+
+    // Keep selection visible.
+    let mut start = 0usize;
+    if picker.selected >= list_h {
+        start = picker.selected + 1 - list_h;
+    }
+    let end = (start + list_h).min(n);
+    let mut lines: Vec<Line> = Vec::new();
+    let name_w = 22usize.min(area.width.saturating_sub(4) as usize / 2).max(8);
+
+    for (i, item) in picker.filtered.iter().enumerate().skip(start).take(end - start) {
+        let selected = i == picker.selected;
+        let style = if selected {
+            Style::default()
+                .fg(Color::Black)
+                .bg(Color::Green)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(Color::White)
+        };
+        let dim = if selected {
+            Style::default()
+                .fg(Color::Black)
+                .bg(Color::Green)
+        } else {
+            Style::default().fg(Color::DarkGray)
+        };
+        let mark = if selected { "› " } else { "  " };
+        let name = truncate_pad(&item.name, name_w);
+        let desc_budget = area.width.saturating_sub(2 + name_w as u16 + 1) as usize;
+        let desc = truncate_ellipsize(&item.description, desc_budget);
+        lines.push(Line::from(vec![
+            Span::styled(format!("{mark}{name}"), style),
+            Span::styled(format!(" {desc}"), dim),
+        ]));
+    }
+
+    frame.render_widget(
+        Paragraph::new(lines),
+        Rect {
+            x: area.x,
+            y: area.y + 1,
+            width: area.width,
+            height: area.height - 1,
+        },
+    );
+}
+
+fn truncate_pad(s: &str, width: usize) -> String {
+    let mut out: String = s.chars().take(width).collect();
+    while out.chars().count() < width {
+        out.push(' ');
+    }
+    out
+}
+
+fn truncate_ellipsize(s: &str, width: usize) -> String {
+    if width == 0 {
+        return String::new();
+    }
+    let count = s.chars().count();
+    if count <= width {
+        return s.to_string();
+    }
+    if width <= 1 {
+        return "…".to_string();
+    }
+    let keep: String = s.chars().take(width - 1).collect();
+    format!("{keep}…")
+}
+
+/// Floating copy/status toast — bottom-center of the frame, above the footer.
+fn draw_toast(frame: &mut Frame, area: Rect, view: &TurnView) {
+    let Some(toast) = view.toast.as_ref() else {
+        return;
+    };
+    if std::time::Instant::now() >= toast.expires {
+        return;
+    }
+    let label = format!(" ✓ {} ", toast.text);
+    let width = (label.chars().count() as u16).min(area.width.saturating_sub(2)).max(1);
+    let x = area.x + area.width.saturating_sub(width) / 2;
+    // Sit just above the footer row.
+    let y = area.y + area.height.saturating_sub(3);
+    if area.height < 3 {
+        return;
+    }
+    let rect = Rect {
+        x,
+        y,
+        width,
+        height: 1,
+    };
+    frame.render_widget(
+        Paragraph::new(Span::styled(
+            label,
+            Style::default()
+                .fg(Color::Black)
+                .bg(Color::Rgb(52, 211, 153)) // soft mint, like Jump to bottom
+                .add_modifier(Modifier::BOLD),
+        )),
+        rect,
+    );
 }
 
 /// Max visual rows the composer may occupy (soft-wrap + explicit newlines).
@@ -279,7 +471,7 @@ fn draw_overlay(frame: &mut Frame, area: Rect, view: &mut TurnView) {
 
     frame.render_widget(
         Paragraph::new(Span::styled(
-            " Transcript history · wheel / PgUp/PgDn · drag select (auto-copy) · Esc close ",
+            " Transcript · wheel / PgUp/PgDn · drag select (auto-copy) · Esc close ",
             Style::default()
                 .fg(Color::Black)
                 .bg(Color::Cyan)
@@ -376,6 +568,24 @@ fn apply_selection_to_lines(
         .collect()
 }
 
+fn agent_header_color(agent: &str) -> Color {
+    match agent {
+        "coding" => Color::LightCyan,
+        "planning" => Color::LightYellow,
+        "researching" => Color::LightGreen,
+        _ => Color::DarkGray,
+    }
+}
+
+fn agent_display(agent: &str) -> Option<&'static str> {
+    match agent {
+        "coding" => Some("CODING"),
+        "planning" => Some("PLANNING"),
+        "researching" => Some("RESEARCHING"),
+        _ => None,
+    }
+}
+
 fn draw_header(frame: &mut Frame, area: Rect, view: &TurnView) {
     let left = Span::styled(
         view.header_left.as_str(),
@@ -383,29 +593,54 @@ fn draw_header(frame: &mut Frame, area: Rect, view: &TurnView) {
             .fg(Color::Cyan)
             .add_modifier(Modifier::BOLD),
     );
-    let right = Span::styled(
-        view.header_right.as_str(),
-        Style::default().fg(Color::DarkGray),
-    );
+
+    let right = if let Some((agent_part, model_part)) = view
+        .header_right
+        .split_once("  ")
+        .filter(|(a, _)| !a.is_empty())
+    {
+        let display = agent_display(agent_part).unwrap_or(agent_part);
+        Line::from(vec![
+            Span::styled(
+                format!("{display}  "),
+                Style::default().fg(agent_header_color(agent_part)),
+            ),
+            Span::styled(
+                model_part.to_string(),
+                Style::default().fg(Color::DarkGray),
+            ),
+        ])
+    } else if view.header_right.is_empty() {
+        Line::from("")
+    } else {
+        Line::from(Span::styled(
+            view.header_right.clone(),
+            Style::default().fg(Color::DarkGray),
+        ))
+    };
+
     let width = area.width as usize;
+    let right_cols: usize = right
+        .spans
+        .iter()
+        .map(|s| s.content.chars().count())
+        .sum();
     let pad = width
         .saturating_sub(view.header_left.chars().count())
-        .saturating_sub(view.header_right.chars().count())
+        .saturating_sub(right_cols)
         .max(1);
-    frame.render_widget(
-        Paragraph::new(Line::from(vec![
-            left,
-            Span::raw(" ".repeat(pad)),
-            right,
-        ])),
-        area,
-    );
+    let mut spans = vec![left, Span::raw(" ".repeat(pad))];
+    spans.extend(right.spans);
+    frame.render_widget(Paragraph::new(Line::from(spans)), area);
 }
 
 fn is_tool_block(kind: TranscriptKind) -> bool {
     matches!(
         kind,
-        TranscriptKind::ToolDone | TranscriptKind::ToolError | TranscriptKind::ToolBody
+        TranscriptKind::ToolDone
+            | TranscriptKind::ToolError
+            | TranscriptKind::ToolBody
+            | TranscriptKind::ErrorBody
     )
 }
 
@@ -434,9 +669,12 @@ fn kind_prefix(kind: TranscriptKind) -> (&'static str, Style) {
         TranscriptKind::UserTime => ("  ", Style::default().fg(Color::DarkGray)),
         TranscriptKind::Spacer => ("", Style::default()),
         TranscriptKind::Thought => ("◆ ", Style::default().fg(Color::DarkGray)),
-        TranscriptKind::ToolDone => ("◔ ", Style::default().fg(Color::White)),
-        TranscriptKind::ToolError => ("◔ ", Style::default().fg(Color::Red)),
+        // Dim tool summaries — they are scaffolding, not primary content.
+        TranscriptKind::ToolDone => ("· ", Style::default().fg(Color::DarkGray)),
+        TranscriptKind::ToolError => ("· ", Style::default().fg(Color::Red)),
         TranscriptKind::ToolBody => ("  ", Style::default().fg(Color::White)),
+        // Error detail is primary content — match assistant prose prominence.
+        TranscriptKind::ErrorBody => ("  ", Style::default().fg(Color::White)),
         TranscriptKind::Info => ("◇ ", Style::default().fg(Color::DarkGray)),
         // Legacy mid-stream queue rows (no longer emitted); treat like user.
         TranscriptKind::Queued => ("› ", Style::default().fg(Color::Green)),
@@ -444,20 +682,122 @@ fn kind_prefix(kind: TranscriptKind) -> (&'static str, Style) {
     }
 }
 
-fn estimate_row_height(row: &TranscriptLine, width: u16, prev_tool: bool) -> usize {
+/// Whether a tool-body line is a unified-style file diff row from [`DiffFormat`].
+///
+/// Examples: `  3 │ context`, `- 5 │ removed`, `+ 5 │ added`, `···`
+fn is_diff_tool_body_line(text: &str) -> bool {
+    let t = text.trim_end();
+    if t == "..." || t == "···" || t == "No changes applied" {
+        return true;
+    }
+    // "+ N │ …" / "- N │ …"
+    if let Some(rest) = t
+        .strip_prefix("+ ")
+        .or_else(|| t.strip_prefix("- "))
+    {
+        return diff_line_has_number_and_sep(rest);
+    }
+    // Equal/context: "  N │ …" (two leading spaces, then digits)
+    if let Some(rest) = t.strip_prefix("  ") {
+        return diff_line_has_number_and_sep(rest.trim_start());
+    }
+    false
+}
+
+fn diff_line_has_number_and_sep(s: &str) -> bool {
+    let mut chars = s.chars().peekable();
+    if !chars.peek().is_some_and(|c| c.is_ascii_digit()) {
+        return false;
+    }
+    while chars.peek().is_some_and(|c| c.is_ascii_digit()) {
+        chars.next();
+    }
+    // optional spaces then | or │
+    while chars.peek() == Some(&' ') {
+        chars.next();
+    }
+    matches!(chars.next(), Some('|') | Some('│'))
+}
+
+/// Color for tool-body text. Diff rows get semantic red/green; todos stay white.
+fn tool_body_style(text: &str) -> Style {
+    if !is_diff_tool_body_line(text) {
+        return Style::default().fg(Color::White);
+    }
+    let t = text.trim_end();
+    if t == "..." || t == "···" || t == "No changes applied" {
+        return Style::default().fg(Color::DarkGray);
+    }
+    if t.starts_with('+') {
+        // Soft green — readable on dark terminals without neon blast.
+        Style::default().fg(Color::Rgb(80, 200, 120))
+    } else if t.starts_with('-') {
+        Style::default().fg(Color::Rgb(255, 100, 100))
+    } else {
+        Style::default().fg(Color::DarkGray)
+    }
+}
+
+/// Whether a blank + horizontal rule + blank should precede this transcript row.
+///
+/// - Assistant after a tool block (existing)
+/// - User after an Info status (e.g. "Turn complete · …") so the next prompt is
+///   visually separated from the finished turn
+fn needs_leading_rule(kind: TranscriptKind, prev: Option<TranscriptKind>) -> bool {
+    match kind {
+        TranscriptKind::Assistant => prev.is_some_and(is_tool_block),
+        TranscriptKind::User => matches!(prev, Some(TranscriptKind::Info)),
+        _ => false,
+    }
+}
+
+fn estimate_row_height(row: &TranscriptLine, width: u16, prev: Option<TranscriptKind>) -> usize {
+    let rule = if needs_leading_rule(row.kind, prev) {
+        3
+    } else {
+        0
+    };
     match row.kind {
-        TranscriptKind::Assistant => {
-            let hr = if prev_tool { 3 } else { 0 };
-            hr + estimate_wrapped_lines(&row.text, width as usize)
-        }
+        TranscriptKind::Assistant => rule + estimate_wrapped_lines(&row.text, width as usize),
         TranscriptKind::Spacer => 1,
         kind => {
             // Match hanging_wrap_lines exactly (word-break can exceed naive ceil).
-            let indent = kind_prefix(kind).0.chars().count();
-            let content_w = (width as usize).saturating_sub(indent).max(1);
-            wrap_text_chunks(&row.text, content_w).len().max(1)
+            let is_diff_body =
+                matches!(kind, TranscriptKind::ToolBody) && is_diff_tool_body_line(&row.text);
+            let (hang_chars, hang_disp) = if is_diff_body {
+                (0, 0)
+            } else {
+                list_marker_hang(kind, &row.text)
+            };
+            let prefix = if (hang_chars > 0 || is_diff_body)
+                && matches!(
+                    kind,
+                    TranscriptKind::ToolBody | TranscriptKind::ErrorBody
+                ) {
+                ""
+            } else {
+                kind_prefix(kind).0
+            };
+            let prefix_cols = display_cols(prefix);
+            let content_w = (width as usize)
+                .saturating_sub(prefix_cols + hang_disp)
+                .max(1);
+            let body: String = row.text.chars().skip(hang_chars).collect();
+            rule + wrap_text_chunks(&body, content_w).len().max(1)
         }
     }
+}
+
+/// Prompt lines for a user turn, optionally preceded by a separator rule.
+fn user_prompt_lines(text: &str, width: u16, with_rule: bool) -> Vec<Line<'static>> {
+    let mut lines = Vec::new();
+    if with_rule {
+        lines.push(Line::from(""));
+        lines.push(horizontal_rule_line(width));
+        lines.push(Line::from(""));
+    }
+    lines.extend(hanging_wrap_lines(TranscriptKind::User, text, width));
+    lines
 }
 
 // ─── On-the-fly line builders (only for the visible window) ─────────────────
@@ -498,37 +838,146 @@ fn wrap_text_chunks(text: &str, width: usize) -> Vec<String> {
     out
 }
 
+/// Terminal display columns for a string. Nerd-font private-use icons often
+/// paint **double-wide** even when UnicodeWidth says 1 — treat PUA as 2.
+fn display_cols(s: &str) -> usize {
+    s.chars().map(display_col_char).sum()
+}
+
+fn display_col_char(c: char) -> usize {
+    match UnicodeWidthChar::width(c) {
+        None | Some(0) => 0,
+        Some(1) if is_private_use(c) => 2, // Nerd Font codicons / PUA
+        Some(w) => w,
+    }
+}
+
+fn is_private_use(c: char) -> bool {
+    matches!(
+        c as u32,
+        0xE000..=0xF8FF | 0xF0000..=0xFFFFD | 0x100000..=0x10FFFD
+    )
+}
+
+/// Char length + display columns of the list/checkbox prefix on a tool-body
+/// line, so wrap continuations hang under the item text (aligned with the
+/// first letter, e.g. `R` of `Rename` with `c` of `coding/...`).
+///
+/// Returns `(char_len, display_cols)` of the prefix through the space after
+/// the marker. For plain bodies, returns leading-space only.
+fn list_marker_hang(kind: TranscriptKind, text: &str) -> (usize, usize) {
+    if !matches!(
+        kind,
+        TranscriptKind::ToolBody | TranscriptKind::ErrorBody
+    ) {
+        return (0, 0);
+    }
+    let chars: Vec<char> = text.chars().collect();
+    let mut i = 0usize;
+    while i < chars.len() && chars[i] == ' ' {
+        i += 1;
+    }
+    let after_lead = i;
+    if after_lead >= chars.len() {
+        return (0, 0);
+    }
+    let lead_disp = after_lead; // spaces are width 1
+
+    // One short marker token (nerd icon / ☐ / - / *) then whitespace.
+    let marker_start = i;
+    while i < chars.len() && !chars[i].is_whitespace() {
+        i += 1;
+        if i - marker_start > 2 {
+            // Normal word, not a checkbox marker.
+            return (after_lead, lead_disp);
+        }
+    }
+    let marker_len = i - marker_start;
+    if marker_len == 0 {
+        return (after_lead, lead_disp);
+    }
+    if i >= chars.len() || !chars[i].is_whitespace() {
+        return (after_lead, lead_disp);
+    }
+    while i < chars.len() && chars[i].is_whitespace() {
+        i += 1;
+    }
+    let prefix: String = chars[..i].iter().collect();
+    (i, display_cols(&prefix))
+}
+
 /// Prefixed rows with **hanging indent**: wrap continuations align with the
-/// first letter of the body (after `◔ ` / `› ` / …), not column 0.
+/// first letter of the body (after `· ` / `› ` / checkbox…), not column 0.
 ///
 /// ```text
-/// ◔ Search for 'long pattern' in rust files at
+/// · Search for 'long pattern' in rust files at
 ///   crates/furcode_main/src · 0.1s
+///
+///   󰄱 Rename agent IDs from forge/muse/sage to
+///      coding/planning/researching
 /// ```
 fn hanging_wrap_lines(kind: TranscriptKind, text: &str, width: u16) -> Vec<Line<'static>> {
-    let (prefix, style) = kind_prefix(kind);
-    let indent = prefix.chars().count();
-    let content_w = (width as usize).saturating_sub(indent).max(1);
-    let cont_prefix = " ".repeat(indent);
-    let chunks = wrap_text_chunks(text, content_w);
+    let (default_prefix, default_style) = kind_prefix(kind);
+    // Diff bodies: color by +/- and skip list-marker hang (sign is not a bullet).
+    let is_diff_body =
+        matches!(kind, TranscriptKind::ToolBody) && is_diff_tool_body_line(text);
+    let style = if is_diff_body {
+        tool_body_style(text)
+    } else {
+        default_style
+    };
+    let (hang_chars, hang_disp) = if is_diff_body {
+        (0, 0)
+    } else {
+        list_marker_hang(kind, text)
+    };
+    // Checklist lines already include their own `"  󰄱 "` indent — do not stack
+    // the ToolBody kind prefix on top (that double-indent made wrap hang wrong).
+    // Diff rows also carry their own indent (`  N │` / `+ N │`); no extra pad.
+    let prefix = if (hang_chars > 0 || is_diff_body)
+        && matches!(
+            kind,
+            TranscriptKind::ToolBody | TranscriptKind::ErrorBody
+        ) {
+        ""
+    } else {
+        default_prefix
+    };
+    let prefix_cols = display_cols(prefix);
+    let hang_prefix: String = text.chars().take(hang_chars).collect();
+    let body: String = text.chars().skip(hang_chars).collect();
+    // Available columns for the item text (after kind prefix + checkbox).
+    let content_w = (width as usize)
+        .saturating_sub(prefix_cols + hang_disp)
+        .max(1);
+    // Continuation pad = display columns of prefix + checkbox hang (so R ‖ c).
+    let cont_prefix = " ".repeat(prefix_cols + hang_disp);
+    let chunks = wrap_text_chunks(&body, content_w);
 
     chunks
         .into_iter()
         .enumerate()
         .map(|(i, chunk)| {
-            let lead = if i == 0 { prefix } else { cont_prefix.as_str() };
-            Line::from(vec![
-                Span::styled(lead.to_string(), style),
-                Span::styled(chunk, style),
-            ])
+            if i == 0 {
+                Line::from(vec![
+                    Span::styled(prefix.to_string(), style),
+                    Span::styled(hang_prefix.clone(), style),
+                    Span::styled(chunk, style),
+                ])
+            } else {
+                Line::from(vec![
+                    Span::styled(cont_prefix.clone(), style),
+                    Span::styled(chunk, style),
+                ])
+            }
         })
         .collect()
 }
 
-fn plain_assistant_lines(md: &str, width: u16, prev_tool: bool) -> Vec<Line<'static>> {
+fn plain_assistant_lines(md: &str, width: u16, with_rule: bool) -> Vec<Line<'static>> {
     let width = (width as usize).max(20);
     let mut out = Vec::new();
-    if prev_tool {
+    if with_rule {
         out.push(Line::from(""));
         out.push(horizontal_rule_line(width as u16));
         out.push(Line::from(""));
@@ -593,9 +1042,9 @@ fn strip_md_light(s: &str) -> String {
     out
 }
 
-fn rich_assistant_lines(md: &str, width: u16, prev_tool: bool) -> Vec<Line<'static>> {
+fn rich_assistant_lines(md: &str, width: u16, with_rule: bool) -> Vec<Line<'static>> {
     let mut lines = Vec::new();
-    if prev_tool {
+    if with_rule {
         lines.push(Line::from(""));
         lines.push(horizontal_rule_line(width));
         lines.push(Line::from(""));
@@ -620,7 +1069,7 @@ fn sync_heights(cache: &mut TranscriptCache, view: &TurnView, width: u16) {
     let n = view.transcript.len();
     cache.heights.resize(n, 1);
 
-    let mut prev_tool = false;
+    let mut prev_kind: Option<TranscriptKind> = None;
     for (i, row) in view.transcript.iter().enumerate() {
         // Prefer measured rich height when we already rendered this row.
         let h = if let Some(rich) = cache.rich.get(&i) {
@@ -632,7 +1081,7 @@ fn sync_heights(cache: &mut TranscriptCache, view: &TurnView, width: u16) {
                 // Source changed (streaming) — drop stale rich + measured.
                 cache.rich.remove(&i);
                 cache.measured.remove(&i);
-                estimate_row_height(row, width, prev_tool)
+                estimate_row_height(row, width, prev_kind)
             }
         } else if row.kind == TranscriptKind::Assistant {
             // Keep last rich measurement after eviction (scroll away) so total
@@ -642,16 +1091,16 @@ fn sync_heights(cache: &mut TranscriptCache, view: &TurnView, width: u16) {
                     h
                 } else {
                     cache.measured.remove(&i);
-                    estimate_row_height(row, width, prev_tool)
+                    estimate_row_height(row, width, prev_kind)
                 }
             } else {
-                estimate_row_height(row, width, prev_tool)
+                estimate_row_height(row, width, prev_kind)
             }
         } else {
-            estimate_row_height(row, width, prev_tool)
+            estimate_row_height(row, width, prev_kind)
         };
         cache.heights[i] = h;
-        prev_tool = is_tool_block(row.kind);
+        prev_kind = Some(row.kind);
     }
 
     // Drop entries that no longer exist.
@@ -661,8 +1110,13 @@ fn sync_heights(cache: &mut TranscriptCache, view: &TurnView, width: u16) {
     cache.recompute_offsets();
 }
 
-fn prev_was_tool(view: &TurnView, idx: usize) -> bool {
-    idx > 0 && is_tool_block(view.transcript[idx - 1].kind)
+fn prev_kind_at(view: &TurnView, idx: usize) -> Option<TranscriptKind> {
+    idx.checked_sub(1)
+        .map(|i| view.transcript[i].kind)
+}
+
+fn leading_rule_at(view: &TurnView, idx: usize) -> bool {
+    needs_leading_rule(view.transcript[idx].kind, prev_kind_at(view, idx))
 }
 
 fn lazy_enrich(cache: &mut TranscriptCache, view: &TurnView, width: u16, start: usize, end: usize) {
@@ -705,7 +1159,7 @@ fn lazy_enrich(cache: &mut TranscriptCache, view: &TurnView, width: u16, start: 
         if !stale {
             continue;
         }
-        let lines = rich_assistant_lines(&row.text, width, prev_was_tool(view, i));
+        let lines = rich_assistant_lines(&row.text, width, leading_rule_at(view, i));
         cache.heights[i] = lines.len().max(1);
         cache.rich.insert(
             i,
@@ -747,8 +1201,16 @@ fn collect_visible(
         let lines: &[Line<'static>] = if let Some(rich) = cache.rich.get(&i) {
             &rich.lines
         } else if row.kind == TranscriptKind::Assistant {
-            owned = plain_assistant_lines(&row.text, width, prev_was_tool(view, i));
+            owned = plain_assistant_lines(&row.text, width, leading_rule_at(view, i));
             // Can't return ref to local — extend directly below.
+            let local_start = start.saturating_sub(row_start);
+            let local_end = (end.saturating_sub(row_start)).min(owned.len());
+            if local_start < local_end {
+                out.extend(owned[local_start..local_end].iter().cloned());
+            }
+            continue;
+        } else if row.kind == TranscriptKind::User {
+            owned = user_prompt_lines(&row.text, width, leading_rule_at(view, i));
             let local_start = start.saturating_sub(row_start);
             let local_end = (end.saturating_sub(row_start)).min(owned.len());
             if local_start < local_end {
@@ -908,12 +1370,50 @@ fn draw_activity(frame: &mut Frame, area: Rect, view: &TurnView, tick: u64) {
     let mut lines: Vec<Line> = Vec::new();
 
     if let Some(status) = view.status_line.as_deref() {
-        lines.push(Line::from(vec![
-            Span::styled(format!("{frame_ch} "), Style::default().fg(Color::Cyan)),
-            Span::styled(status.to_string(), Style::default().fg(Color::DarkGray)),
-        ]));
-        frame.render_widget(Paragraph::new(lines), area);
-        return;
+        match view.status_tone {
+            // After interrupt: bright red "Interrupted", no spinner, blank-flanked.
+            StatusTone::Interrupted => {
+                lines.push(Line::from(""));
+                lines.push(interrupted_status_line(status));
+                lines.push(Line::from(""));
+                frame.render_widget(Paragraph::new(lines), area);
+                return;
+            }
+            // First empty Enter after interrupt — dim, no spinner, blank-flanked.
+            StatusTone::Hint => {
+                lines.push(Line::from(""));
+                lines.push(Line::from(Span::styled(
+                    status.to_string(),
+                    Style::default().fg(Color::DarkGray),
+                )));
+                lines.push(Line::from(""));
+                frame.render_widget(Paragraph::new(lines), area);
+                return;
+            }
+            // Spinner only for Interrupting… (red) and Loading… (cyan).
+            StatusTone::Interrupting => {
+                lines.push(Line::from(vec![
+                    Span::styled(
+                        format!("{frame_ch} "),
+                        Style::default().fg(Color::Rgb(255, 85, 85)),
+                    ),
+                    Span::styled(
+                        status.to_string(),
+                        Style::default().fg(Color::Rgb(255, 85, 85)),
+                    ),
+                ]));
+                frame.render_widget(Paragraph::new(lines), area);
+                return;
+            }
+            StatusTone::Loading => {
+                lines.push(Line::from(vec![
+                    Span::styled(format!("{frame_ch} "), Style::default().fg(Color::Cyan)),
+                    Span::styled(status.to_string(), Style::default().fg(Color::DarkGray)),
+                ]));
+                frame.render_widget(Paragraph::new(lines), area);
+                return;
+            }
+        }
     }
 
     match &view.activity {
@@ -932,7 +1432,7 @@ fn draw_activity(frame: &mut Frame, area: Rect, view: &TurnView, tick: u64) {
                 Span::styled("Thinking", Style::default().fg(Color::Cyan)),
                 Span::styled(
                     format!(" · {secs:.1}s"),
-                    Style::default().fg(Color::DarkGray),
+                    Style::default().fg(Color::White),
                 ),
             ]));
             for preview in TurnView::last_preview_lines(buffer, 2) {
@@ -1085,6 +1585,31 @@ fn composer_cursor_cell(buffer: &str, cursor: usize, content_width: usize) -> (u
     (best, col)
 }
 
+/// Style composer text, highlighting `[Image N]` clipboard atoms in magenta.
+fn composer_content_spans(chunk: &str) -> Vec<Span<'static>> {
+    let white = Style::default().fg(Color::White);
+    let image = Style::default()
+        .fg(Color::Magenta)
+        .add_modifier(Modifier::BOLD);
+    let ranges = crate::paste::image_atom_ranges(chunk);
+    if ranges.is_empty() {
+        return vec![Span::styled(chunk.to_string(), white)];
+    }
+    let mut spans = Vec::new();
+    let mut i = 0usize;
+    for &(start, end) in &ranges {
+        if start > i {
+            spans.push(Span::styled(chunk[i..start].to_string(), white));
+        }
+        spans.push(Span::styled(chunk[start..end].to_string(), image));
+        i = end;
+    }
+    if i < chunk.len() {
+        spans.push(Span::styled(chunk[i..].to_string(), white));
+    }
+    spans
+}
+
 fn draw_composer(frame: &mut Frame, area: Rect, view: &TurnView) {
     if area.height == 0 || area.width == 0 {
         return;
@@ -1105,10 +1630,9 @@ fn draw_composer(frame: &mut Frame, area: Rect, view: &TurnView) {
         let chunk = &view.composer.buffer[start..end.min(view.composer.buffer.len())];
         let prefix = if i == 0 { "› " } else { "  " };
         let prefix_style = if i == 0 { green } else { white };
-        lines.push(Line::from(vec![
-            Span::styled(prefix.to_string(), prefix_style),
-            Span::styled(chunk.to_string(), white),
-        ]));
+        let mut spans = vec![Span::styled(prefix.to_string(), prefix_style)];
+        spans.extend(composer_content_spans(chunk));
+        lines.push(Line::from(spans));
     }
     if lines.is_empty() {
         lines.push(Line::from(vec![
@@ -1132,18 +1656,45 @@ fn draw_composer(frame: &mut Frame, area: Rect, view: &TurnView) {
     }
 }
 
+/// Footer chip: `Key:action` pairs separated by ` | ` (Claude/Codex-style).
+/// Shortcut keys are bright; colon + description stay dim.
+fn footer_line(pairs: &[(&str, &str)]) -> Line<'static> {
+    let key_style = Style::default().fg(Color::White);
+    let action_style = Style::default().fg(Color::DarkGray);
+    let sep_style = Style::default().fg(Color::DarkGray);
+    let mut spans: Vec<Span> = Vec::with_capacity(pairs.len() * 5);
+    for (i, (key, action)) in pairs.iter().enumerate() {
+        if i > 0 {
+            spans.push(Span::styled(" | ".to_string(), sep_style));
+        }
+        spans.push(Span::styled(key.to_string(), key_style));
+        spans.push(Span::styled(format!(":{action}"), action_style));
+    }
+    Line::from(spans)
+}
+
 fn draw_footer(frame: &mut Frame, area: Rect, view: &TurnView) {
-    let help = if !view.is_at_bottom() {
-        "Wheel/↑↓ scroll · drag select (auto-copy) · End latest · Esc Esc history · Ctrl+C quit"
+    // Short key:action chips — brighter gray than the old DarkGray prose.
+    let line = if !view.is_at_bottom() {
+        footer_line(&[
+            ("End", "latest"),
+            ("Esc ×2", "undo"),
+            ("Ctrl+C", "quit"),
+        ])
     } else if view.busy {
-        "Wheel/↑↓ · drag select · Esc interrupt · Enter queue · Esc Esc history · Ctrl+C quit"
+        footer_line(&[
+            ("Enter", "queue"),
+            ("Esc", "cancel"),
+            ("Ctrl+C", "quit"),
+        ])
     } else {
-        "Enter send · Wheel/↑↓ scroll · drag select (auto-copy) · Esc Esc history · Ctrl+C quit"
+        footer_line(&[
+            ("Enter", "send"),
+            ("Esc ×2", "undo"),
+            ("Ctrl+C", "quit"),
+        ])
     };
-    frame.render_widget(
-        Paragraph::new(Span::styled(help, Style::default().fg(Color::DarkGray))),
-        area,
-    );
+    frame.render_widget(Paragraph::new(line), area);
 }
 
 #[cfg(test)]
@@ -1165,14 +1716,14 @@ mod tests {
 
         let first = line_plain(&lines[0]);
         let second = line_plain(&lines[1]);
-        assert!(first.starts_with("◔ "), "first={first:?}");
-        // Continuation aligns under the body (after "◔ "), not under column 0.
+        assert!(first.starts_with("· "), "first={first:?}");
+        // Continuation aligns under the body (after "· "), not under column 0.
         assert!(
-            second.starts_with("  ") && !second.starts_with("◔ "),
+            second.starts_with("  ") && !second.starts_with("· "),
             "second should hang-indent, got {second:?}"
         );
         // Body of continuation starts at same column as first body char.
-        let indent = "◔ ".chars().count();
+        let indent = "· ".chars().count();
         assert_eq!(
             second.chars().take(indent).all(|c| c == ' '),
             true,
@@ -1189,7 +1740,7 @@ mod tests {
     fn short_tool_stays_one_line() {
         let lines = hanging_wrap_lines(TranscriptKind::ToolDone, "Read main.rs · 0.1s", 80);
         assert_eq!(lines.len(), 1);
-        assert_eq!(line_plain(&lines[0]), "◔ Read main.rs · 0.1s");
+        assert_eq!(line_plain(&lines[0]), "· Read main.rs · 0.1s");
     }
 
     #[test]
@@ -1219,8 +1770,127 @@ mod tests {
                 .into(),
         };
         let width = 48u16;
-        let h = estimate_row_height(&row, width, false);
+        let h = estimate_row_height(&row, width, None);
         let lines = hanging_wrap_lines(row.kind, &row.text, width);
+        assert_eq!(h, lines.len());
+    }
+
+    #[test]
+    fn todo_body_wrap_hangs_under_item_text() {
+        // Same shape as format_todo_line: leading spaces + icon + space + content.
+        let text =
+            "  󰄱 Rename agent IDs from forge/muse/sage to coding/planning/researching";
+        let width = 48u16;
+        let lines = hanging_wrap_lines(TranscriptKind::ToolBody, text, width);
+        assert!(
+            lines.len() >= 2,
+            "expected wrap for long todo, got {}",
+            lines.len()
+        );
+
+        let first = line_plain(&lines[0]);
+        let second = line_plain(&lines[1]);
+
+        let (hang_chars, hang_disp) = list_marker_hang(TranscriptKind::ToolBody, text);
+        assert_eq!(hang_chars, 4, "  + icon + space (chars)");
+        // PUA nerd icon counts as 2 display cols → hang display 2+2+1 = 5.
+        assert_eq!(hang_disp, 5, "  + icon(2) + space");
+        // No extra ToolBody kind prefix when a list marker is present.
+        let content_col = hang_disp; // R and c both start here
+
+        // Continuation is pure spaces then body text — no checkbox re-print.
+        assert!(
+            !second.contains('󰄱'),
+            "continuation must not repeat checkbox: {second:?}"
+        );
+        let cont_spaces = second.chars().take_while(|c| *c == ' ').count();
+        assert_eq!(
+            cont_spaces, content_col,
+            "continuation must align under item text (col {content_col}), got {cont_spaces}; first={first:?} second={second:?}"
+        );
+
+        // Display column of R on line 1 equals display column of c on line 2.
+        let r_disp = display_cols(
+            &first
+                .chars()
+                .take_while(|c| *c != 'R')
+                .collect::<String>(),
+        );
+        let c_disp = cont_spaces;
+        assert_eq!(
+            r_disp, c_disp,
+            "R (disp {r_disp}) must align with c (disp {c_disp}); first={first:?} second={second:?}"
+        );
+        assert!(
+            first.contains('R') && second.trim_start().starts_with('c'),
+            "first={first:?} second={second:?}"
+        );
+        // Expected shape:
+        // "  󰄱 Rename … to"
+        // "     coding/…"   (5 spaces — under R, not under checkbox)
+        assert!(
+            first.starts_with("  󰄱 "),
+            "first line should be indent+icon only once: {first:?}"
+        );
+
+        // Height estimator must match paint.
+        let row = TranscriptLine {
+            kind: TranscriptKind::ToolBody,
+            text: text.into(),
+        };
+        assert_eq!(estimate_row_height(&row, width, None), lines.len());
+    }
+
+    #[test]
+    fn detects_diff_tool_body_lines() {
+        assert!(is_diff_tool_body_line("  3 │ line 3"));
+        assert!(is_diff_tool_body_line("- 5 │ line 5"));
+        assert!(is_diff_tool_body_line("+ 5 │ modified line 5"));
+        assert!(is_diff_tool_body_line("···"));
+        assert!(is_diff_tool_body_line("No changes applied"));
+        // Todos / prose must not look like diffs.
+        assert!(!is_diff_tool_body_line(
+            "  󰄱 Rename agent IDs from forge/muse/sage"
+        ));
+        assert!(!is_diff_tool_body_line("hello world"));
+    }
+
+    #[test]
+    fn diff_body_renders_without_extra_indent() {
+        let text = "+ 2 │ modified line";
+        let lines = hanging_wrap_lines(TranscriptKind::ToolBody, text, 80);
+        assert_eq!(lines.len(), 1);
+        assert_eq!(line_plain(&lines[0]), text);
+    }
+
+    #[test]
+    fn user_after_turn_complete_gets_leading_rule() {
+        assert!(needs_leading_rule(
+            TranscriptKind::User,
+            Some(TranscriptKind::Info)
+        ));
+        assert!(!needs_leading_rule(
+            TranscriptKind::User,
+            Some(TranscriptKind::Assistant)
+        ));
+        assert!(!needs_leading_rule(TranscriptKind::User, None));
+
+        let lines = user_prompt_lines("next prompt", 40, true);
+        assert!(lines.len() >= 4, "blank + rule + blank + prompt");
+        assert_eq!(line_plain(&lines[0]), "");
+        assert!(
+            line_plain(&lines[1]).chars().all(|c| c == '─'),
+            "expected hr, got {:?}",
+            line_plain(&lines[1])
+        );
+        assert_eq!(line_plain(&lines[2]), "");
+        assert!(line_plain(&lines[3]).contains("next prompt"));
+
+        let row = TranscriptLine {
+            kind: TranscriptKind::User,
+            text: "next prompt".into(),
+        };
+        let h = estimate_row_height(&row, 40, Some(TranscriptKind::Info));
         assert_eq!(h, lines.len());
     }
 }

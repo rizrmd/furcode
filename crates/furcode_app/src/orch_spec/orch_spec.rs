@@ -87,10 +87,23 @@ async fn test_followup_does_not_trigger_session_summary() {
         .flatten()
         .any(|response| matches!(response, ChatResponse::TaskComplete));
 
+    let has_waiting_for_user = ctx.output.chat_responses.iter().flatten().any(|response| {
+        matches!(
+            response,
+            ChatResponse::Interrupt {
+                reason: furcode_domain::InterruptionReason::WaitingForUser { .. }
+            }
+        )
+    });
+
     assert!(!ctx.output.tools().is_empty(), "Context should've tools.");
     assert!(
         !has_chat_complete,
         "Should NOT have TaskComplete response for followup"
+    );
+    assert!(
+        has_waiting_for_user,
+        "Followup yield must emit Interrupt::WaitingForUser so the UI never stops silently"
     );
 }
 
@@ -199,12 +212,12 @@ async fn test_tool_call_start_end_responses_for_non_agent_tools() {
 
 #[tokio::test]
 async fn test_no_tool_call_start_end_responses_for_agent_tools() {
-    // Call an agent tool (using "forge" which is configured as an agent in the
+    // Call an agent tool (using "coding" which is configured as an agent in the
     // default workflow)
-    let agent_tool_call = ToolCallFull::new("forge")
+    let agent_tool_call = ToolCallFull::new("coding")
         .arguments(ToolCallArguments::from(json!({"tasks": ["analyze code"]})));
     let agent_tool_result =
-        ToolResult::new("forge").output(Ok(ToolOutput::text("analysis complete")));
+        ToolResult::new("coding").output(Ok(ToolOutput::text("analysis complete")));
 
     let mut ctx = TestContext::default()
         .mock_tool_call_responses(vec![(agent_tool_call.clone(), agent_tool_result.clone())])

@@ -74,9 +74,9 @@ impl<I: FileInfoInfra + EnvironmentInfra<Config = FurcodeConfig> + DirectoryRead
         let config = self.infra.get_config()?;
         parse_agent_iter(
             [
-                ("forge", include_str!("agents/forge.md")),
-                ("muse", include_str!("agents/muse.md")),
-                ("sage", include_str!("agents/sage.md")),
+                ("coding", include_str!("agents/coding.md")),
+                ("planning", include_str!("agents/planning.md")),
+                ("researching", include_str!("agents/researching.md")),
             ]
             .into_iter()
             .map(|(name, content)| (name.to_string(), content.to_string())),
@@ -152,7 +152,7 @@ fn apply_subagent_tool_config(
     mut agent: AgentDefinition,
     config: &FurcodeConfig,
 ) -> Result<AgentDefinition> {
-    if agent.id.as_str() != "forge" {
+    if agent.id.as_str() != "coding" {
         return Ok(agent);
     }
 
@@ -160,7 +160,7 @@ fn apply_subagent_tool_config(
         return Ok(agent);
     };
 
-    tools.retain(|tool| !matches!(tool.as_str(), "task" | "sage"));
+    tools.retain(|tool| !matches!(tool.as_str(), "task" | "researching"));
 
     if config.subagents {
         let insert_index = tools
@@ -268,11 +268,11 @@ mod tests {
     #[test]
     fn test_parse_agent_file_renders_conditional_frontmatter_when_subagents_enabled() {
         let fixture = r#"---
-id: "forge"
+id: "coding"
 tools:
   - read
   - task
-  - sage
+  - researching
   - mcp_*
 ---
 Body keeps {{tool_names.read}} untouched.
@@ -282,7 +282,7 @@ Body keeps {{tool_names.read}} untouched.
         let actual =
             apply_subagent_tool_config(parse_agent_file(fixture).unwrap(), &config).unwrap();
 
-        assert_eq!(actual.id, AgentId::new("forge"));
+        assert_eq!(actual.id, AgentId::new("coding"));
         assert_eq!(
             actual.system_prompt.unwrap().template,
             "Body keeps {{tool_names.read}} untouched."
@@ -293,11 +293,11 @@ Body keeps {{tool_names.read}} untouched.
     #[test]
     fn test_parse_agent_file_renders_conditional_frontmatter_when_subagents_disabled() {
         let fixture = r#"---
-id: "forge"
+id: "coding"
 tools:
   - read
   - task
-  - sage
+  - researching
   - mcp_*
 ---
 Body keeps {{tool_names.read}} untouched.
@@ -307,7 +307,7 @@ Body keeps {{tool_names.read}} untouched.
         let actual =
             apply_subagent_tool_config(parse_agent_file(fixture).unwrap(), &config).unwrap();
 
-        assert_eq!(actual.id, AgentId::new("forge"));
+        assert_eq!(actual.id, AgentId::new("coding"));
         assert_snapshot!(
             "parse_agent_file_subagents_disabled_prompt",
             actual.system_prompt.unwrap().template
@@ -318,11 +318,11 @@ Body keeps {{tool_names.read}} untouched.
     #[test]
     fn test_parse_agent_file_preserves_runtime_user_prompt_variables() {
         let fixture = r#"---
-id: "forge"
+id: "coding"
 tools:
   - read
   - task
-  - sage
+  - researching
   - mcp_*
 user_prompt: |-
   <{{event.name}}>{{event.value}}</{{event.name}}>
@@ -334,7 +334,7 @@ Body keeps {{tool_names.read}} untouched.
         let actual = parse_agent_file(fixture).unwrap();
         let actual_user_prompt = actual.user_prompt.clone().unwrap().template;
 
-        assert_eq!(actual.id, AgentId::new("forge"));
+        assert_eq!(actual.id, AgentId::new("coding"));
         assert_snapshot!(
             "parse_agent_file_preserves_runtime_user_prompt_variables",
             actual_user_prompt

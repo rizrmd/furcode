@@ -87,17 +87,18 @@ impl FurcodePrompt {
         let total_tokens = self.usage.as_ref().map(|u| u.total_tokens);
         let active = total_tokens.map(|t| *t > 0).unwrap_or(false);
 
-        let agent_color = if active {
-            Color::LightGray
-        } else {
-            Color::DarkGray
+        let agent_color = match self.agent_id.as_str() {
+            "coding" => Color::LightCyan,
+            "planning" => Color::LightYellow,
+            "researching" => Color::LightGreen,
+            _ => Color::LightGray,
         };
         let mut result = String::with_capacity(64);
 
-        // Display label for the active agent. The built-in implementation agent
-        // still has id `forge` for compatibility (`/act`), but we show FURCODE.
         let agent_str = match self.agent_id.as_str() {
-            "forge" => "FURCODE".to_string(),
+            "coding" => "CODING".to_string(),
+            "planning" => "PLANNING".to_string(),
+            "researching" => "RESEARCHING".to_string(),
             other => other.to_case(Case::UpperSnake),
         };
         write!(
@@ -269,7 +270,7 @@ mod tests {
         let _ = prompt.model(ModelId::new("gpt-4"));
 
         let actual = prompt.render_prompt_right();
-        assert!(actual.contains("FURCODE"));
+        assert!(actual.contains("CODING"));
         assert!(actual.contains("gpt-4"));
         assert!(!actual.contains("1k") && !actual.contains("~"));
     }
@@ -287,7 +288,7 @@ mod tests {
 
         let actual = prompt.render_prompt_right();
         assert!(actual.contains("~30"));
-        assert!(actual.contains("FURCODE"));
+        assert!(actual.contains("CODING"));
     }
 
     #[test]

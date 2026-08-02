@@ -1,7 +1,7 @@
 //! Frame-based interactive TUI (Codex-style layout).
 //!
-//! Enable with `FURCODE_TUI=1` (or `FURCODE_TUI=true`). The legacy line-oriented
-//! UI remains the default until this path is promoted.
+//! This is the **default and only** interactive UI. Non-interactive one-shots
+//! (`-p`, piped input, subcommands) still use the line/spinner path.
 //!
 //! ## Architecture
 //!
@@ -11,6 +11,7 @@
 //! - [`session`] — crossterm draw loop + host action channel
 
 mod apply;
+pub(crate) mod error_format;
 mod history;
 mod markdown;
 mod render;
@@ -22,19 +23,18 @@ pub use history::{
     HistoryArchive, HistoryBootstrap, LOAD_MORE_TURNS, bootstrap_from_context_json,
     bootstrap_from_conversation,
 };
-pub use session::{SessionOutcome, TuiSession, UserAction, join_session, start_session};
+pub use session::{
+    SessionOutcome, TuiSession, TuiSuspendGuard, UserAction, join_session, start_session,
+};
 pub use view::{
-    ActivityPhase, ComposerState, ForkItem, ForkPicker, PendingPrompt, TranscriptKind,
-    TranscriptLine, TranscriptOverlay, TurnView, push_or_collapse_tool,
+    ActivityPhase, CommandItem, CommandPicker, ComposerState, ForkItem, ForkPicker, PendingPrompt,
+    StatusTone, TranscriptKind, TranscriptLine, TranscriptOverlay, TurnView, push_or_collapse_tool,
 };
 
-/// Returns true when the new frame TUI should be used for interactive sessions.
+/// Interactive sessions always use the frame TUI.
+///
+/// Kept for call sites / docs; always returns `true`. The old `FURCODE_TUI=1`
+/// opt-in and line-oriented interactive REPL have been removed.
 pub fn enabled() -> bool {
-    match std::env::var("FURCODE_TUI") {
-        Ok(v) => {
-            let v = v.trim();
-            v == "1" || v.eq_ignore_ascii_case("true") || v.eq_ignore_ascii_case("yes")
-        }
-        Err(_) => false,
-    }
+    true
 }

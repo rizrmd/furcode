@@ -83,8 +83,8 @@ pub struct TaskInput {
     /// accurately.
     pub tasks: Vec<String>,
 
-    /// The ID of the specialized agent to delegate to (e.g., "forge", "muse",
-    /// "sage")
+    /// The ID of the specialized agent to delegate to (e.g., "coding",
+    /// "planning", "researching")
     pub agent_id: String,
 
     /// Optional session ID to continue an existing agent session. If not

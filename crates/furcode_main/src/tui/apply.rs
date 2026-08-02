@@ -38,51 +38,69 @@ pub fn apply_chat_response(view: &mut TurnView, message: ChatResponse) {
         }
         ChatResponse::ToolCallEnd(result) => {
             if result.is_error() {
+                // Prefer a short human detail; drop protocol noise like
+                // `<tool_call_error>` so the row stays "Search … failed · 0.2s".
                 let detail = result
                     .output
                     .as_str()
-                    .map(|s| {
-                        let one = s.lines().find(|l| !l.trim().is_empty()).unwrap_or(s);
-                        let t: String = one.chars().take(80).collect();
-                        if one.chars().count() > 80 {
-                            format!("{t}…")
-                        } else {
-                            t
-                        }
-                    })
-                    .filter(|s| !s.is_empty());
+                    .and_then(tool_error_detail_for_display);
                 view.finish_tool(detail);
             } else {
                 view.finish_tool(None);
             }
         }
         ChatResponse::RetryAttempt { cause, .. } => {
-            view.push_transcript(super::view::TranscriptLine {
-                kind: TranscriptKind::Info,
-                text: format!("Retry: {}", cause.as_str()),
-            });
+            // Compact: "Retry · rate limited (429)" + short hint — not raw JSON.
+            for line in super::error_format::format_retry_cause(cause.as_str()) {
+                view.push_transcript(line);
+            }
         }
         ChatResponse::Interrupt { reason } => {
-            let title = match reason {
-                furcode_domain::InterruptionReason::MaxRequestPerTurnLimitReached { limit } => {
-                    format!("Maximum request ({limit}) per turn achieved")
-                }
-                furcode_domain::InterruptionReason::MaxToolFailurePerTurnLimitReached {
-                    limit,
-                    ..
-                } => {
-                    format!("Maximum tool failure limit ({limit}) reached for this turn")
-                }
-            };
             view.push_transcript(super::view::TranscriptLine {
                 kind: TranscriptKind::Info,
-                text: title,
+                text: reason.user_message(),
             });
             view.mark_idle();
         }
         ChatResponse::TaskComplete => {
+            // Model finished without tools — never go idle silently.
+            view.push_transcript(super::view::TranscriptLine {
+                kind: TranscriptKind::Info,
+                text: "Turn complete · model finished (no more tools) · send a message to continue"
+                    .into(),
+            });
             view.mark_idle();
         }
+    }
+}
+
+/// Short, user-facing tool failure detail — or `None` to show only "failed".
+fn tool_error_detail_for_display(raw: &str) -> Option<String> {
+    let one = raw
+        .lines()
+        .map(str::trim)
+        .find(|l| !l.is_empty())
+        .unwrap_or("")
+        .trim();
+    if one.is_empty() {
+        return None;
+    }
+    let lower = one.to_ascii_lowercase();
+    // Internal / protocol placeholders — not useful in the transcript.
+    if lower == "<tool_call_error>"
+        || lower == "tool_call_error"
+        || lower.contains("<tool_call_error")
+        || lower == "<error>"
+        || lower == "error"
+        || lower.starts_with("<tool_") && lower.ends_with('>')
+    {
+        return None;
+    }
+    let t: String = one.chars().take(80).collect();
+    if one.chars().count() > 80 {
+        Some(format!("{t}…"))
+    } else {
+        Some(t)
     }
 }
 

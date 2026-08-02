@@ -93,15 +93,53 @@ impl ChatResponse {
     }
 }
 
+/// Why an agent turn stopped or paused.
+///
+/// Every yield path in the orchestrator must surface one of these so the UI
+/// never goes idle without an explanation.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum InterruptionReason {
+    /// Too many failed tool calls in this turn.
     MaxToolFailurePerTurnLimitReached {
         limit: u64,
         errors: HashMap<ToolName, usize>,
     },
+    /// Too many model round-trips in this turn.
     MaxRequestPerTurnLimitReached {
         limit: u64,
     },
+    /// A tool (e.g. `followup`) asked to yield control to the user.
+    WaitingForUser {
+        /// Tool name that requested the pause.
+        tool: String,
+    },
+    /// Orchestrator exited without a normal complete/interrupt signal
+    /// (defensive fallback — should be rare).
+    UnexpectedEnd,
+}
+
+impl InterruptionReason {
+    /// One-line user-facing explanation of why the turn stopped.
+    pub fn user_message(&self) -> String {
+        match self {
+            InterruptionReason::MaxRequestPerTurnLimitReached { limit } => {
+                format!(
+                    "Turn paused · reached max model requests ({limit}) this turn · send a message to continue"
+                )
+            }
+            InterruptionReason::MaxToolFailurePerTurnLimitReached { limit, .. } => {
+                format!(
+                    "Turn paused · too many tool failures (limit {limit}) · send a message to continue"
+                )
+            }
+            InterruptionReason::WaitingForUser { tool } => {
+                format!("Turn paused · waiting for you ({tool}) · reply to continue")
+            }
+            InterruptionReason::UnexpectedEnd => {
+                "Turn ended · unexpected stop · send a message to continue".into()
+            }
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -234,5 +272,37 @@ mod tests {
         assert_eq!(title.sub_title, Some("Subtitle".to_string()));
         assert_eq!(title.category, Category::Action);
         assert_eq!(title.timestamp, timestamp);
+    }
+
+    #[test]
+    fn test_interruption_reason_messages_are_non_empty() {
+        let cases = [
+            InterruptionReason::MaxRequestPerTurnLimitReached { limit: 10 },
+            InterruptionReason::MaxToolFailurePerTurnLimitReached {
+                limit: 3,
+                errors: Default::default(),
+            },
+            InterruptionReason::WaitingForUser {
+                tool: "followup".into(),
+            },
+            InterruptionReason::UnexpectedEnd,
+        ];
+        for reason in cases {
+            let msg = reason.user_message();
+            assert!(!msg.is_empty(), "{reason:?}");
+            assert!(
+                msg.contains("continue") || msg.contains("reply"),
+                "expected guidance to continue: {msg}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_waiting_for_user_mentions_tool() {
+        let actual = InterruptionReason::WaitingForUser {
+            tool: "followup".into(),
+        }
+        .user_message();
+        assert!(actual.contains("followup"), "{actual}");
     }
 }

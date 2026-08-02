@@ -1061,20 +1061,20 @@ mod tests {
 
     #[test]
     fn test_agent_id_long_flag() {
-        let fixture = Cli::parse_from(["furcode", "--agent", "sage"]);
-        assert_eq!(fixture.agent, Some(AgentId::new("sage")));
+        let fixture = Cli::parse_from(["furcode", "--agent", "researching"]);
+        assert_eq!(fixture.agent, Some(AgentId::new("researching")));
     }
 
     #[test]
     fn test_agent_id_short_alias() {
-        let fixture = Cli::parse_from(["furcode", "--aid", "muse"]);
-        assert_eq!(fixture.agent, Some(AgentId::new("muse")));
+        let fixture = Cli::parse_from(["furcode", "--aid", "planning"]);
+        assert_eq!(fixture.agent, Some(AgentId::new("planning")));
     }
 
     #[test]
     fn test_agent_id_with_prompt() {
-        let fixture = Cli::parse_from(["furcode", "--agent", "forge", "-p", "test prompt"]);
-        assert_eq!(fixture.agent, Some(AgentId::new("forge")));
+        let fixture = Cli::parse_from(["furcode", "--agent", "coding", "-p", "test prompt"]);
+        assert_eq!(fixture.agent, Some(AgentId::new("coding")));
         assert_eq!(fixture.prompt, Some("test prompt".to_string()));
     }
 
@@ -1239,7 +1239,7 @@ mod tests {
 
     #[test]
     fn test_list_tools_command_with_agent() {
-        let fixture = Cli::parse_from(["furcode", "list", "tool", "sage"]);
+        let fixture = Cli::parse_from(["furcode", "list", "tool", "researching"]);
         let actual = match fixture.subcommands {
             Some(TopLevelCommand::List(list)) => match list.command {
                 ListCommand::Tool { agent } => agent,
@@ -1247,7 +1247,7 @@ mod tests {
             },
             _ => AgentId::default(),
         };
-        let expected = AgentId::new("sage");
+        let expected = AgentId::new("researching");
         assert_eq!(actual, expected);
     }
 

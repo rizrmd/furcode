@@ -2,11 +2,11 @@
 source: crates/furcode_display/src/diff.rs
 expression: clean_diff
 ---
-2 2 | line 2
-3 3 | line 3
-4 4 | line 4
-5   |-line 5
-  5 |+modified line 5
-6 6 | line 6
-7 7 | line 7
-8 8 | line 8
+  2 │ line 2
+  3 │ line 3
+  4 │ line 4
+- 5 │ line 5
++ 5 │ modified line 5
+  6 │ line 6
+  7 │ line 7
+  8 │ line 8

@@ -255,8 +255,11 @@ impl<S: AgentService + EnvironmentInfra<Config = furcode_config::FurcodeConfig>>
         // Signals that the loop should suspend (task may or may not be completed)
         let mut should_yield = false;
 
-        // Signals that the task is completed
+        // Signals that the task is completed (model stop + no tools)
         let mut is_complete = false;
+
+        // Whether we already emitted a terminal Interrupt this turn.
+        let mut emitted_interrupt = false;
 
         let mut request_count = 0;
 
@@ -324,12 +327,14 @@ impl<S: AgentService + EnvironmentInfra<Config = furcode_config::FurcodeConfig>>
             is_complete =
                 message.finish_reason == Some(FinishReason::Stop) && message.tool_calls.is_empty();
 
-            // Should yield if a tool is asking for a follow-up
-            should_yield = is_complete
-                || message
-                    .tool_calls
-                    .iter()
-                    .any(|call| ToolCatalog::should_yield(&call.name));
+            let followup_tool = message
+                .tool_calls
+                .iter()
+                .find(|call| ToolCatalog::should_yield(&call.name))
+                .map(|call| call.name.to_string());
+
+            // Should yield if complete or a tool is asking for a follow-up
+            should_yield = is_complete || followup_tool.is_some();
 
             // Process tool calls and update context
             let mut tool_call_records = self
@@ -377,6 +382,7 @@ impl<S: AgentService + EnvironmentInfra<Config = furcode_config::FurcodeConfig>>
                     },
                 })
                 .await?;
+                emitted_interrupt = true;
                 // Should yield if too many errors are produced
                 should_yield = true;
             }
@@ -405,6 +411,7 @@ impl<S: AgentService + EnvironmentInfra<Config = furcode_config::FurcodeConfig>>
                         },
                     })
                     .await?;
+                    emitted_interrupt = true;
                     // force completion
                     should_yield = true;
                 }
@@ -437,15 +444,46 @@ impl<S: AgentService + EnvironmentInfra<Config = furcode_config::FurcodeConfig>>
                         context = updated_context.clone();
                     }
                     should_yield = false;
+                    // Pending-todos (etc.) kept us going — not a terminal end.
+                    is_complete = false;
+                    continue;
+                }
+
+                // Still yielding: every stop path must emit a reason.
+                // Max-request / max-tool-failure already sent Interrupt above.
+                if !emitted_interrupt {
+                    if is_complete {
+                        // Model finished — TaskComplete below (after loop).
+                    } else if let Some(tool) = followup_tool {
+                        self.send(ChatResponse::Interrupt {
+                            reason: InterruptionReason::WaitingForUser { tool },
+                        })
+                        .await?;
+                        emitted_interrupt = true;
+                    } else {
+                        // Defensive: yielded without a known reason.
+                        self.send(ChatResponse::Interrupt {
+                            reason: InterruptionReason::UnexpectedEnd,
+                        })
+                        .await?;
+                        emitted_interrupt = true;
+                    }
                 }
             }
         }
 
         self.services.update(self.conversation.clone()).await?;
 
-        // Signal Task Completion
+        // Signal Task Completion (model finished with stop + no tools).
+        // UI surfaces an explicit reason for this path.
         if is_complete {
             self.send(ChatResponse::TaskComplete).await?;
+        } else if !emitted_interrupt {
+            // Loop exited without complete or interrupt — never go silent.
+            self.send(ChatResponse::Interrupt {
+                reason: InterruptionReason::UnexpectedEnd,
+            })
+            .await?;
         }
 
         Ok(())

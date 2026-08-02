@@ -262,7 +262,7 @@ mod tests {
         let fixture = vec![
             ToolName::new("write"),
             ToolName::new("read"),
-            ToolName::new("sage"),
+            ToolName::new("researching"),
             ToolName::new("patch"),
             ToolName::new("sem_search"),
         ];
@@ -273,7 +273,7 @@ mod tests {
         // Should maintain exact order as specified
         assert_eq!(names[0], "write");
         assert_eq!(names[1], "read");
-        assert_eq!(names[2], "sage");
+        assert_eq!(names[2], "researching");
         assert_eq!(names[3], "patch");
         assert_eq!(names[4], "sem_search");
     }

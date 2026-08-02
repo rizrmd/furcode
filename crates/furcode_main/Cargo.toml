@@ -16,6 +16,7 @@ clap_complete.workspace = true
 console.workspace = true
 crossterm = "0.29.0"
 ratatui.workspace = true
+unicode-width.workspace = true
 # Terminal markdown renderer for the frame TUI (AGPL-3.0 — keep isolated to TUI path).
 md-tui = { version = "0.10.3", default-features = false, features = ["tree-sitter"] }
 furcode_app.workspace = true
@@ -86,6 +87,20 @@ windows-sys = { version = "0.61", features = ["Win32_System_Console"] }
 arboard = { version = "3.4", features = ["image-data"] }
 # Encode clipboard RGBA pixels to PNG for `@[path]` image attachments.
 image = { version = "0.25", default-features = false, features = ["png"] }
+
+# Cheap NSPasteboard type probe + raw PNG/JPEG dump (no multi‑MB RGBA round-trip).
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = "0.6"
+objc2-foundation = { version = "0.3", default-features = false, features = [
+    "std",
+    "NSArray",
+    "NSData",
+    "NSString",
+] }
+objc2-app-kit = { version = "0.3", default-features = false, features = [
+    "std",
+    "NSPasteboard",
+] }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt", "time", "test-util"] }
