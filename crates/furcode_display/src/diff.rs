@@ -120,12 +120,23 @@ impl DiffFormat {
                         style(num).dim(),
                     ));
 
-                    for (_, value) in change.iter_strings_lossy() {
-                        output.push_str(&format!("{}", s.apply_to(value)));
+                    let content: String = change
+                        .iter_strings_lossy()
+                        .map(|(_, value)| value)
+                        .collect();
+
+                    let trimmed = content.trim_end_matches('\n');
+                    if trimmed.contains('\n') {
+                        let first_line = trimmed.split('\n').next().unwrap_or("");
+                        output.push_str(first_line);
+                        output.push_str("···");
+                    } else {
+                        for (_, value) in change.iter_strings_lossy() {
+                            output.push_str(&format!("{}", s.apply_to(value)));
+                        }
                     }
-                    if change.missing_newline() {
-                        output.push('\n');
-                    }
+
+                    output.push('\n');
                 }
             }
         }
