@@ -16,6 +16,7 @@ mod history;
 mod markdown;
 mod render;
 mod session;
+mod transcript_store;
 mod view;
 
 pub use apply::apply_chat_response;
@@ -26,9 +27,11 @@ pub use history::{
 pub use session::{
     SessionOutcome, TuiSession, TuiSuspendGuard, UserAction, join_session, start_session,
 };
+pub use transcript_store::{delete_transcript, load_transcript, save_transcript};
 pub use view::{
     ActivityPhase, CommandItem, CommandPicker, ComposerState, ForkItem, ForkPicker, PendingPrompt,
-    StatusTone, TranscriptKind, TranscriptLine, TranscriptOverlay, TurnView, push_or_collapse_tool,
+    StatusTone, TranscriptKind, TranscriptLine, TranscriptOverlay, TurnView, UserPromptHit,
+    UserPromptPopup, push_or_collapse_tool,
 };
 
 /// Interactive sessions always use the frame TUI.

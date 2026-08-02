@@ -87,18 +87,19 @@ impl FurcodePrompt {
         let total_tokens = self.usage.as_ref().map(|u| u.total_tokens);
         let active = total_tokens.map(|t| *t > 0).unwrap_or(false);
 
+        // CODE = blue, PLAN = green, RESEARCH = purple
         let agent_color = match self.agent_id.as_str() {
-            "coding" => Color::LightCyan,
-            "planning" => Color::LightYellow,
-            "researching" => Color::LightGreen,
+            "coding" => Color::Rgb(80, 160, 255),
+            "planning" => Color::Rgb(80, 200, 120),
+            "researching" => Color::Rgb(180, 100, 255),
             _ => Color::LightGray,
         };
         let mut result = String::with_capacity(64);
 
         let agent_str = match self.agent_id.as_str() {
-            "coding" => "CODING".to_string(),
-            "planning" => "PLANNING".to_string(),
-            "researching" => "RESEARCHING".to_string(),
+            "coding" => "CODE".to_string(),
+            "planning" => "PLAN".to_string(),
+            "researching" => "RESEARCH".to_string(),
             other => other.to_case(Case::UpperSnake),
         };
         write!(
@@ -270,7 +271,7 @@ mod tests {
         let _ = prompt.model(ModelId::new("gpt-4"));
 
         let actual = prompt.render_prompt_right();
-        assert!(actual.contains("CODING"));
+        assert!(actual.contains("CODE"));
         assert!(actual.contains("gpt-4"));
         assert!(!actual.contains("1k") && !actual.contains("~"));
     }
@@ -288,7 +289,7 @@ mod tests {
 
         let actual = prompt.render_prompt_right();
         assert!(actual.contains("~30"));
-        assert!(actual.contains("CODING"));
+        assert!(actual.contains("CODE"));
     }
 
     #[test]

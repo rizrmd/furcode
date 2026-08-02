@@ -160,7 +160,10 @@ fn apply_subagent_tool_config(
         return Ok(agent);
     };
 
-    tools.retain(|tool| !matches!(tool.as_str(), "task" | "researching"));
+    // Always keep `planning` / `researching` agent tools so the model can enter
+    // PLAN / RESEARCH mode itself (no slash command, no keyword inference).
+    // `task` remains gated on config.subagents.
+    tools.retain(|tool| tool.as_str() != "task");
 
     if config.subagents {
         let insert_index = tools

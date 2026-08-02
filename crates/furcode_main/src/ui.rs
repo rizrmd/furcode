@@ -159,6 +159,15 @@ enum FrameSlashOutcome {
     Chat(Event),
 }
 
+/// Result of the conversation picker (no UI side effects beyond the widget).
+enum ConversationPick {
+    Selected(ConversationId),
+    /// User dismissed the picker.
+    Cancelled,
+    /// Workspace has no user-initiated conversations.
+    Empty,
+}
+
 /// Result of driving one agent stream in the frame TUI.
 enum FrameStreamOutcome {
     /// Return to the idle prompt loop.
@@ -494,8 +503,7 @@ impl<A: API + ConsoleWriter + 'static, F: Fn(FurcodeConfig) -> A + Send + Sync> 
     /// Runs the frame-based interactive TUI (default interactive UI).
     async fn run_frame_tui(&mut self) -> Result<()> {
         use crate::tui::{
-            LOAD_MORE_TURNS, UserAction, apply_chat_response, bootstrap_from_context_json,
-            join_session, start_session,
+            LOAD_MORE_TURNS, UserAction, apply_chat_response, join_session, start_session,
         };
         use furcode_domain::Event;
         use tokio_stream::StreamExt;
@@ -521,13 +529,8 @@ impl<A: API + ConsoleWriter + 'static, F: Fn(FurcodeConfig) -> A + Send + Sync> 
             if a.is_empty() {
                 model
             } else {
-                let display = match a.as_str() {
-                    "coding" => "CODING",
-                    "planning" => "PLANNING",
-                    "researching" => "RESEARCHING",
-                    other => other,
-                };
-                format!("{display}  {model}")
+                // Keep raw agent id; render maps to CODE/PLAN/RESEARCH + colors.
+                format!("{a}  {model}")
             }
         } else {
             model
@@ -543,67 +546,9 @@ impl<A: API + ConsoleWriter + 'static, F: Fn(FurcodeConfig) -> A + Send + Sync> 
 
         // Dual-tier resume via **raw context JSON** (never full Conversation decode —
         // tool output bodies alone are 50–90KB each and hung the previous path).
-        //
-        // Important: after clear_status the draw loop must see `transcript_gen`
-        // bump (set_status/clear_status/touch) or the "Loading…" frame stays
-        // painted forever.
+        // Same path as slash `/resume` — keep startup and mid-session restore in sync.
         if let Some(id) = self.state.conversation_id {
-            {
-                let mut v = session.view.lock().unwrap_or_else(|e| e.into_inner());
-                v.set_status("Loading conversation…");
-            }
-            // Let the draw loop paint the spinner before we hit SQLite.
-            tokio::time::sleep(Duration::from_millis(16)).await;
-
-            let load = async {
-                let raw = self.api.conversation_context_json(&id).await?;
-                Ok::<_, anyhow::Error>(raw)
-            };
-            // Hard cap so a stuck pool/DB can never leave the UI on Loading forever.
-            match tokio::time::timeout(Duration::from_secs(8), load).await {
-                Ok(Ok(Some(json))) => {
-                    let env = self.api.environment();
-                    {
-                        let mut v = session.view.lock().unwrap_or_else(|e| e.into_inner());
-                        v.set_status("Building transcript…");
-                    }
-                    // Yield so "Building…" can paint; slim parse is typically <5ms.
-                    tokio::task::yield_now().await;
-                    let boot = bootstrap_from_context_json(&json, &env);
-                    drop(json);
-                    let mut v = session.view.lock().unwrap_or_else(|e| e.into_inner());
-                    v.history_archive = Some(boot.archive);
-                    if !boot.visible.is_empty() {
-                        v.extend_transcript(boot.visible);
-                        v.scroll_to_bottom();
-                    }
-                    v.clear_status();
-                }
-                Ok(Ok(None)) => {
-                    tracing::debug!(%id, "no context JSON for conversation");
-                    let mut v = session.view.lock().unwrap_or_else(|e| e.into_inner());
-                    v.clear_status();
-                }
-                Ok(Err(err)) => {
-                    tracing::warn!(error = ?err, "failed to load context JSON for TUI resume");
-                    let mut v = session.view.lock().unwrap_or_else(|e| e.into_inner());
-                    v.push_transcript(crate::tui::TranscriptLine {
-                        kind: crate::tui::TranscriptKind::Info,
-                        text: format!("Could not load history: {err:#}"),
-                    });
-                    v.clear_status();
-                }
-                Err(_) => {
-                    tracing::warn!(%id, "TUI history load timed out");
-                    let mut v = session.view.lock().unwrap_or_else(|e| e.into_inner());
-                    v.push_transcript(crate::tui::TranscriptLine {
-                        kind: crate::tui::TranscriptKind::Info,
-                        text: "History load timed out — continue chatting; full context still in DB"
-                            .into(),
-                    });
-                    v.clear_status();
-                }
-            }
+            self.frame_tui_load_history(&session, id, false).await?;
         }
 
         let mut pending: VecDeque<String> = VecDeque::new();
@@ -643,9 +588,13 @@ impl<A: API + ConsoleWriter + 'static, F: Fn(FurcodeConfig) -> A + Send + Sync> 
                     }) => {
                         self.frame_tui_apply_fork(&session, message_index, edit_text)
                             .await?;
+                        self.frame_tui_save_transcript(&session);
                         continue;
                     }
-                    Some(UserAction::Quit) | None => break,
+                    Some(UserAction::Quit) | None => {
+                        self.frame_tui_save_transcript(&session);
+                        break;
+                    }
                 }
             };
 
@@ -664,6 +613,7 @@ impl<A: API + ConsoleWriter + 'static, F: Fn(FurcodeConfig) -> A + Send + Sync> 
             if crate::tui::TurnView::composer_is_slash_command(&msg) {
                 match self.frame_tui_handle_slash(&session, &msg).await? {
                     FrameSlashOutcome::Quit => {
+                        self.frame_tui_save_transcript(&session);
                         let _ = join_session(session).await;
                         self.print_exit_resume_hint()?;
                         return Ok(());
@@ -697,11 +647,13 @@ impl<A: API + ConsoleWriter + 'static, F: Fn(FurcodeConfig) -> A + Send + Sync> 
                             .await?
                         {
                             FrameStreamOutcome::Continue => {
+                                self.frame_tui_save_transcript(&session);
                                 session
                                     .interrupt
                                     .store(false, std::sync::atomic::Ordering::SeqCst);
                             }
                             FrameStreamOutcome::Quit => {
+                                self.frame_tui_save_transcript(&session);
                                 let _ = join_session(session).await;
                                 self.print_exit_resume_hint()?;
                                 return Ok(());
@@ -730,11 +682,13 @@ impl<A: API + ConsoleWriter + 'static, F: Fn(FurcodeConfig) -> A + Send + Sync> 
                 .await?
             {
                 FrameStreamOutcome::Continue => {
+                    self.frame_tui_save_transcript(&session);
                     session
                         .interrupt
                         .store(false, std::sync::atomic::Ordering::SeqCst);
                 }
                 FrameStreamOutcome::Quit => {
+                    self.frame_tui_save_transcript(&session);
                     let _ = join_session(session).await;
                     self.print_exit_resume_hint()?;
                     return Ok(());
@@ -806,13 +760,8 @@ impl<A: API + ConsoleWriter + 'static, F: Fn(FurcodeConfig) -> A + Send + Sync> 
             if a.is_empty() {
                 model
             } else {
-                let display = match a.as_str() {
-                    "coding" => "CODING",
-                    "planning" => "PLANNING",
-                    "researching" => "RESEARCHING",
-                    other => other,
-                };
-                format!("{display}  {model}")
+                // Keep raw agent id; render maps to CODE/PLAN/RESEARCH + colors.
+                format!("{a}  {model}")
             }
         } else {
             model
@@ -820,6 +769,299 @@ impl<A: API + ConsoleWriter + 'static, F: Fn(FurcodeConfig) -> A + Send + Sync> 
         let mut v = session.view.lock().unwrap_or_else(|e| e.into_inner());
         v.header_right = header_right;
         v.touch_transcript();
+    }
+
+    /// Persist the live frame transcript so `/resume` can restore it exactly.
+    ///
+    /// Best-effort: failures are logged and ignored so I/O never blocks the UI.
+    fn frame_tui_save_transcript(&self, session: &crate::tui::TuiSession) {
+        let Some(id) = self.state.conversation_id else {
+            return;
+        };
+        let id_str = id.into_string();
+        let lines = {
+            let v = session.view.lock().unwrap_or_else(|e| e.into_inner());
+            v.transcript.clone()
+        };
+        if lines.is_empty() {
+            return;
+        }
+        let env = self.api.environment();
+        if let Err(err) = crate::tui::save_transcript(&env, &id_str, &lines) {
+            tracing::warn!(
+                error = %err,
+                conversation_id = %id_str,
+                "failed to save TUI transcript snapshot"
+            );
+        }
+    }
+
+    /// Restore the frame TUI surface for a conversation (startup + `/resume`).
+    ///
+    /// Prefer an **exact snapshot** written while the session was live (same
+    /// rows as when left: tool timings, thoughts, TaskComplete, tool bodies).
+    /// Fall back to slim dual-tier rebuild from context JSON when no snapshot
+    /// exists (older conversations).
+    ///
+    /// No extra "Resumed …" chrome is added — the surface matches the snapshot.
+    async fn frame_tui_load_history(
+        &mut self,
+        session: &crate::tui::TuiSession,
+        id: ConversationId,
+        _announce_resume: bool,
+    ) -> Result<()> {
+        use crate::tui::bootstrap_from_context_json;
+
+        {
+            let mut v = session.view.lock().unwrap_or_else(|e| e.into_inner());
+            v.set_status("Loading conversation…");
+        }
+        // Let the draw loop paint the spinner before disk/SQLite work.
+        tokio::time::sleep(Duration::from_millis(16)).await;
+
+        let id_str = id.into_string();
+        let env = self.api.environment();
+
+        // 1) Exact snapshot path — byte-identical transcript when available.
+        if let Some(lines) = crate::tui::load_transcript(&env, &id_str) {
+            let catalog = self.tui_command_catalog();
+            let mut v = session.view.lock().unwrap_or_else(|e| e.into_inner());
+            v.reset_session_view();
+            v.set_command_catalog(catalog);
+            // Full surface: no windowing / summary stub — this *is* the view.
+            v.history_archive = None;
+            if !lines.is_empty() {
+                v.extend_transcript(lines);
+            }
+            v.scroll_to_bottom();
+            v.clear_status();
+            return Ok(());
+        }
+
+        // 2) Fallback: slim rebuild from context (pre-snapshot sessions).
+        let load = async {
+            let raw = self.api.conversation_context_json(&id).await?;
+            Ok::<_, anyhow::Error>(raw)
+        };
+
+        match tokio::time::timeout(Duration::from_secs(8), load).await {
+            Ok(Ok(Some(json))) => {
+                {
+                    let mut v = session.view.lock().unwrap_or_else(|e| e.into_inner());
+                    v.set_status("Building transcript…");
+                }
+                tokio::task::yield_now().await;
+                let env = self.api.environment();
+                let boot = bootstrap_from_context_json(&json, &env);
+                drop(json);
+                let catalog = self.tui_command_catalog();
+                let mut v = session.view.lock().unwrap_or_else(|e| e.into_inner());
+                v.reset_session_view();
+                v.set_command_catalog(catalog);
+                // Show the full slim archive, not a 6-turn window — closer to
+                // "as left" for sessions without a snapshot.
+                if !boot.archive.turns.is_empty() {
+                    let mut all = Vec::new();
+                    for turn in &boot.archive.turns {
+                        all.extend(turn.lines.iter().cloned());
+                    }
+                    v.history_archive = Some(crate::tui::HistoryArchive {
+                        turns: boot.archive.turns,
+                        shown_from: 0,
+                    });
+                    v.extend_transcript(all);
+                } else {
+                    v.history_archive = Some(boot.archive);
+                    if !boot.visible.is_empty() {
+                        v.extend_transcript(boot.visible);
+                    }
+                }
+                v.scroll_to_bottom();
+                v.clear_status();
+            }
+            Ok(Ok(None)) => {
+                tracing::debug!(%id, "no context JSON for conversation");
+                let catalog = self.tui_command_catalog();
+                let mut v = session.view.lock().unwrap_or_else(|e| e.into_inner());
+                v.reset_session_view();
+                v.set_command_catalog(catalog);
+                v.clear_status();
+            }
+            Ok(Err(err)) => {
+                tracing::warn!(error = ?err, "failed to load context JSON for TUI history");
+                let catalog = self.tui_command_catalog();
+                let mut v = session.view.lock().unwrap_or_else(|e| e.into_inner());
+                v.reset_session_view();
+                v.set_command_catalog(catalog);
+                v.push_transcript(crate::tui::TranscriptLine {
+                    kind: crate::tui::TranscriptKind::ToolError,
+                    text: format!("Could not load history: {err:#}"),
+                });
+                v.clear_status();
+            }
+            Err(_) => {
+                tracing::warn!(%id, "TUI history load timed out");
+                let catalog = self.tui_command_catalog();
+                let mut v = session.view.lock().unwrap_or_else(|e| e.into_inner());
+                v.reset_session_view();
+                v.set_command_catalog(catalog);
+                v.push_transcript(crate::tui::TranscriptLine {
+                    kind: crate::tui::TranscriptKind::Info,
+                    text: "History load timed out — continue chatting; full context still in DB"
+                        .into(),
+                });
+                v.clear_status();
+            }
+        }
+        Ok(())
+    }
+
+    /// Interactive picker for user-initiated conversations.
+    async fn pick_user_conversation(&mut self) -> Result<ConversationPick> {
+        self.spinner.start(Some("Loading Conversations"))?;
+        let max_conversations = self.config.max_conversations;
+        let conversations = self.api.get_conversations(Some(max_conversations)).await?;
+        let conversations = Self::user_initiated_conversations(conversations);
+        self.spinner.stop(None)?;
+
+        if conversations.is_empty() {
+            return Ok(ConversationPick::Empty);
+        }
+
+        let selected = ConversationSelector::select_conversation(
+            &conversations,
+            self.state.conversation_id,
+            None,
+        )
+        .await?;
+        Ok(match selected {
+            Some(c) => ConversationPick::Selected(c.id),
+            None => ConversationPick::Cancelled,
+        })
+    }
+
+    /// Frame TUI: `/resume` — switch conversation and rebuild the transcript.
+    async fn frame_tui_resume(
+        &mut self,
+        session: &crate::tui::TuiSession,
+        id: Option<String>,
+    ) -> Result<FrameSlashOutcome> {
+        // Picker needs the primary screen; suspend alt-screen first.
+        let _suspend = session.suspend_terminal().ok();
+        let pick = if let Some(raw_id) = id {
+            let conversation_id = ConversationId::parse(&raw_id)
+                .context(format!("Invalid conversation ID: {raw_id}"))?;
+            match self.validate_conversation_exists(&conversation_id).await {
+                Ok(_) => Ok(ConversationPick::Selected(conversation_id)),
+                Err(err) => Err(err),
+            }
+        } else {
+            self.pick_user_conversation().await
+        };
+        drop(_suspend);
+
+        match pick {
+            Ok(ConversationPick::Selected(conversation_id)) => {
+                self.state.conversation_id = Some(conversation_id);
+                self.frame_tui_load_history(session, conversation_id, true)
+                    .await?;
+                self.frame_tui_refresh_header(session).await;
+                Ok(FrameSlashOutcome::NewSession)
+            }
+            Ok(ConversationPick::Cancelled) => {
+                let mut v = session.view.lock().unwrap_or_else(|e| e.into_inner());
+                v.busy = false;
+                Ok(FrameSlashOutcome::Done)
+            }
+            Ok(ConversationPick::Empty) => {
+                let mut v = session.view.lock().unwrap_or_else(|e| e.into_inner());
+                v.busy = false;
+                v.push_transcript(crate::tui::TranscriptLine {
+                    kind: crate::tui::TranscriptKind::Info,
+                    text: "No conversations found in this workspace.".into(),
+                });
+                Ok(FrameSlashOutcome::Done)
+            }
+            Err(err) => {
+                let mut v = session.view.lock().unwrap_or_else(|e| e.into_inner());
+                v.busy = false;
+                v.push_transcript(crate::tui::TranscriptLine {
+                    kind: crate::tui::TranscriptKind::ToolError,
+                    text: format!("{err:#}"),
+                });
+                Ok(FrameSlashOutcome::Done)
+            }
+        }
+    }
+
+    /// Frame TUI: `/conversation-tree` — pick a child and restore its transcript.
+    async fn frame_tui_resume_tree(
+        &mut self,
+        session: &crate::tui::TuiSession,
+    ) -> Result<FrameSlashOutcome> {
+        enum TreePick {
+            Cancelled,
+            Empty,
+            Id(ConversationId),
+        }
+
+        let _suspend = session.suspend_terminal().ok();
+        let result: Result<TreePick> = async {
+            let conversation_id = self
+                .state
+                .conversation_id
+                .ok_or_else(|| anyhow::anyhow!("No active conversation"))?;
+            let parent = self.validate_conversation_exists(&conversation_id).await?;
+            let children = self.fetch_related_conversations(&parent).await;
+            if children.is_empty() {
+                return Ok(TreePick::Empty);
+            }
+            let selected = ConversationSelector::select_conversation(
+                &children,
+                self.state.conversation_id,
+                None,
+            )
+            .await?;
+            Ok(match selected {
+                Some(c) => TreePick::Id(c.id),
+                None => TreePick::Cancelled,
+            })
+        }
+        .await;
+        drop(_suspend);
+
+        match result {
+            Ok(TreePick::Id(conversation_id)) => {
+                self.state.conversation_id = Some(conversation_id);
+                self.frame_tui_load_history(session, conversation_id, true)
+                    .await?;
+                self.frame_tui_refresh_header(session).await;
+                Ok(FrameSlashOutcome::NewSession)
+            }
+            Ok(TreePick::Empty) => {
+                let mut v = session.view.lock().unwrap_or_else(|e| e.into_inner());
+                v.busy = false;
+                v.push_transcript(crate::tui::TranscriptLine {
+                    kind: crate::tui::TranscriptKind::Info,
+                    text: "No child conversations found.".into(),
+                });
+                Ok(FrameSlashOutcome::Done)
+            }
+            Ok(TreePick::Cancelled) => {
+                let mut v = session.view.lock().unwrap_or_else(|e| e.into_inner());
+                v.busy = false;
+                Ok(FrameSlashOutcome::Done)
+            }
+            Err(err) => {
+                let mut v = session.view.lock().unwrap_or_else(|e| e.into_inner());
+                v.busy = false;
+                v.push_transcript(crate::tui::TranscriptLine {
+                    kind: crate::tui::TranscriptKind::ToolError,
+                    text: format!("{err:#}"),
+                });
+                Ok(FrameSlashOutcome::Done)
+            }
+        }
     }
 
     /// Parse and run a slash/shell command from the frame TUI.
@@ -846,6 +1088,8 @@ impl<A: API + ConsoleWriter + 'static, F: Fn(FurcodeConfig) -> A + Send + Sync> 
             AppCommand::Custom(user_cmd) => Ok(FrameSlashOutcome::Chat(Event::from(user_cmd))),
             AppCommand::Retry => Ok(FrameSlashOutcome::Chat(Event::empty())),
             AppCommand::Exit => Ok(FrameSlashOutcome::Quit),
+            AppCommand::Conversations { id } => self.frame_tui_resume(session, id).await,
+            AppCommand::ConversationTree => self.frame_tui_resume_tree(session).await,
             AppCommand::New => {
                 // Fresh conversation: new empty context + wipe the TUI surface.
                 let _suspend = session.suspend_terminal().ok();
@@ -1040,8 +1284,21 @@ impl<A: API + ConsoleWriter + 'static, F: Fn(FurcodeConfig) -> A + Send + Sync> 
                             ) {
                                 saw_terminal_reason = true;
                             }
-                            let mut v = session.view.lock().unwrap_or_else(|e| e.into_inner());
-                            apply_chat_response(&mut v, message);
+                            // Agent tools (planning/researching/…) set the active
+                            // agent; keep the header in sync without requiring /plan.
+                            let refresh_header = matches!(
+                                &message,
+                                ChatResponse::TaskMessage {
+                                    content: furcode_domain::ChatResponseContent::ToolInput(title),
+                                } if title.title.contains("[Agent]")
+                            );
+                            {
+                                let mut v = session.view.lock().unwrap_or_else(|e| e.into_inner());
+                                apply_chat_response(&mut v, message);
+                            }
+                            if refresh_header {
+                                self.frame_tui_refresh_header(session).await;
+                            }
                         }
                         Some(Err(err)) => {
                             let mut v = session.view.lock().unwrap_or_else(|e| e.into_inner());
@@ -1320,8 +1577,7 @@ impl<A: API + ConsoleWriter + 'static, F: Fn(FurcodeConfig) -> A + Send + Sync> 
             if !boot.visible.is_empty() {
                 v.extend_transcript(boot.visible);
             }
-            v.composer.buffer = edit_text;
-            v.composer.cursor = v.composer.buffer.len();
+            v.composer.set_text(edit_text);
             v.pending.clear();
             v.busy = false;
             v.fork_picker = None;
@@ -1888,7 +2144,7 @@ impl<A: API + ConsoleWriter + 'static, F: Fn(FurcodeConfig) -> A + Send + Sync> 
             }
             TopLevelCommand::Update(args) => {
                 let update = furcode_config::Update::default().auto_update(args.no_confirm);
-                on_update(self.api.clone(), Some(&update)).await;
+                on_update(self.api.clone(), Some(&update), self.api.environment()).await;
                 return Ok(());
             }
             TopLevelCommand::Logs(args) => {
@@ -2088,6 +2344,7 @@ impl<A: API + ConsoleWriter + 'static, F: Fn(FurcodeConfig) -> A + Send + Sync> 
     ) -> anyhow::Result<()> {
         self.spinner.start(Some("Deleting conversation"))?;
         self.api.delete_conversation(&conversation_id).await?;
+        crate::tui::delete_transcript(&self.api.environment(), &conversation_id.into_string());
         self.spinner.stop(None)?;
         self.writeln_title(TitleFormat::debug(format!(
             "Successfully deleted conversation '{}'",
@@ -3034,40 +3291,26 @@ impl<A: API + ConsoleWriter + 'static, F: Fn(FurcodeConfig) -> A + Send + Sync> 
     }
 
     async fn list_conversations(&mut self) -> anyhow::Result<()> {
-        self.spinner.start(Some("Loading Conversations"))?;
-        let max_conversations = self.config.max_conversations;
-        let conversations = self.api.get_conversations(Some(max_conversations)).await?;
-        let conversations = Self::user_initiated_conversations(conversations);
-        self.spinner.stop(None)?;
+        // Line-oriented path: picker + last message + info summary.
+        // Frame TUI uses `frame_tui_resume` instead (full slim transcript restore).
+        match self.pick_user_conversation().await? {
+            ConversationPick::Selected(conversation_id) => {
+                let conversation = self.validate_conversation_exists(&conversation_id).await?;
+                self.state.conversation_id = Some(conversation_id);
 
-        if conversations.is_empty() {
-            self.writeln_title(TitleFormat::error(
-                "No conversations found in this workspace.",
-            ))?;
-            return Ok(());
-        }
-
-        if let Some(conversation) = ConversationSelector::select_conversation(
-            &conversations,
-            self.state.conversation_id,
-            None,
-        )
-        .await?
-        {
-            let conversation_id = conversation.id;
-            self.state.conversation_id = Some(conversation_id);
-
-            // Show conversation content
-            self.on_show_last_message(conversation, false).await?;
-
-            // Print log about conversation switching
-            self.writeln_title(TitleFormat::info(format!(
-                "Switched to conversation {}",
-                conversation_id.into_string().bold()
-            )))?;
-
-            // Show conversation info
-            self.on_info(false, Some(conversation_id)).await?;
+                self.on_show_last_message(conversation, false).await?;
+                self.writeln_title(TitleFormat::info(format!(
+                    "Switched to conversation {}",
+                    conversation_id.into_string().bold()
+                )))?;
+                self.on_info(false, Some(conversation_id)).await?;
+            }
+            ConversationPick::Empty => {
+                self.writeln_title(TitleFormat::error(
+                    "No conversations found in this workspace.",
+                ))?;
+            }
+            ConversationPick::Cancelled => {}
         }
         Ok(())
     }
@@ -3236,7 +3479,7 @@ impl<A: API + ConsoleWriter + 'static, F: Fn(FurcodeConfig) -> A + Send + Sync> 
                 self.on_show_tools(agent_id, false).await?;
             }
             AppCommand::Update => {
-                on_update(self.api.clone(), None).await;
+                on_update(self.api.clone(), None, self.api.environment()).await;
             }
             AppCommand::Exit => {
                 self.print_exit_resume_hint()?;
@@ -4942,7 +5185,7 @@ impl<A: API + ConsoleWriter + 'static, F: Fn(FurcodeConfig) -> A + Send + Sync> 
                 .set_active_agent(active_agent.clone().unwrap_or_default())
                 .await?;
             // only call on_update if this is the first initialization
-            on_update(self.api.clone(), self.config.updates.as_ref()).await;
+            on_update(self.api.clone(), self.config.updates.as_ref(), self.api.environment()).await;
             // Apply the MCP trust gate. Servers are NOT connected here —
             // connections remain lazy and happen on first tool use.
             self.api.init_mcp().await?;

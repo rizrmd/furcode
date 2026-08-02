@@ -16,8 +16,9 @@ use ratatui::widgets::Paragraph;
 use unicode_width::UnicodeWidthChar;
 
 use super::view::{
-    ActivityPhase, HitRect, SelectablePaint, StatusTone, TextSelection, TranscriptKind,
-    TranscriptLine, TurnView,
+    ActivityPhase, COMPOSER_PREFIX_COLS, HitRect, SelectablePaint, StatusTone, TextSelection,
+    TranscriptKind, TranscriptLine, TurnView, UserPromptHit, composer_content_width,
+    composer_cursor_cell, soft_wrap_ranges,
 };
 
 const SPINNER: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
@@ -26,6 +27,10 @@ const JUMP_BOTTOM_LABEL: &str = " ↓ Jump to bottom ";
 const RICH_OVERSCAN: usize = 16;
 /// Hard cap on richly-rendered assistant rows kept in memory.
 const MAX_RICH_ROWS: usize = 12;
+/// Soft-wrapped user prompts longer than this show 2 body lines + `…`.
+const USER_PROMPT_MAX_FULL_LINES: usize = 3;
+/// Body lines kept when a user prompt is truncated (ellipsis is the next row).
+const USER_PROMPT_TRUNCATED_BODY: usize = 2;
 
 // ─── Lean cache ─────────────────────────────────────────────────────────────
 
@@ -125,13 +130,27 @@ pub fn draw(frame: &mut Frame, view: &mut TurnView, tick: u64) {
 
     // Double-Esc fork picker (user message history).
     if view.fork_picker.is_some() {
+        view.composer_hit = None;
+        view.composer_dragging = false;
         draw_fork_picker(frame, area, view);
         return;
     }
 
     // Full-screen transcript history (double-Esc).
     if view.overlay.is_some() {
+        view.composer_hit = None;
+        view.composer_dragging = false;
+        view.user_prompt_hits.clear();
         draw_overlay(frame, area, view);
+        return;
+    }
+
+    // Click-to-expand long user prompt.
+    if view.user_prompt_popup.is_some() {
+        view.composer_hit = None;
+        view.composer_dragging = false;
+        view.user_prompt_hits.clear();
+        draw_user_prompt_popup(frame, area, view);
         return;
     }
 
@@ -336,7 +355,6 @@ fn draw_toast(frame: &mut Frame, area: Rect, view: &TurnView) {
 
 /// Max visual rows the composer may occupy (soft-wrap + explicit newlines).
 const COMPOSER_MAX_ROWS: u16 = 8;
-const COMPOSER_PREFIX_COLS: usize = 2; // "› " / hanging indent
 
 /// Screen rows for sticky pending prompts (always above activity / composer).
 fn pending_row_count(view: &TurnView) -> u16 {
@@ -364,8 +382,8 @@ fn draw_pending(frame: &mut Frame, area: Rect, view: &TurnView) {
     let width = area.width.max(20);
     let mut lines: Vec<Line> = Vec::new();
     for (i, p) in view.pending.iter().enumerate() {
-        // Same look as a real user prompt (green), sticky until the turn ends.
-        lines.extend(hanging_wrap_lines(TranscriptKind::User, &p.text, width));
+        // Same look as a real user prompt (green), soft-capped like transcript.
+        lines.extend(user_prompt_hanging_lines(&p.text, width));
         lines.push(Line::from(vec![
             Span::styled("  ", Style::default().fg(Color::DarkGray)),
             Span::styled(
@@ -520,6 +538,65 @@ fn draw_overlay(frame: &mut Frame, area: Rect, view: &mut TurnView) {
     );
 }
 
+/// Full-screen viewer for a long user prompt (opened by clicking truncated › text).
+fn draw_user_prompt_popup(frame: &mut Frame, area: Rect, view: &mut TurnView) {
+    let Some(popup) = view.user_prompt_popup.as_ref() else {
+        return;
+    };
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(1),
+            Constraint::Min(3),
+            Constraint::Length(1),
+        ])
+        .split(area);
+
+    frame.render_widget(
+        Paragraph::new(Span::styled(
+            " User prompt · wheel / PgUp/PgDn · drag select · Esc close ",
+            Style::default()
+                .fg(Color::Black)
+                .bg(Color::Green)
+                .add_modifier(Modifier::BOLD),
+        )),
+        chunks[0],
+    );
+
+    let width = chunks[1].width.max(20);
+    // Full text — never truncate inside the popup.
+    let expanded = hanging_wrap_lines(TranscriptKind::User, &popup.text, width);
+    let height = chunks[1].height as usize;
+    let total = expanded.len();
+    let max_scroll = total.saturating_sub(height.max(1));
+    let scroll = popup.scroll_offset.min(max_scroll);
+    let end = total.saturating_sub(scroll);
+    let start = end.saturating_sub(height.max(1));
+    let visible = expanded[start..end].to_vec();
+    view.last_content_lines = total;
+    view.last_viewport_rows = height.max(1);
+
+    let plain: Vec<String> = visible.iter().map(line_plain_text).collect();
+    view.selectable = SelectablePaint {
+        area: HitRect {
+            x: chunks[1].x,
+            y: chunks[1].y,
+            width: chunks[1].width,
+            height: chunks[1].height,
+        },
+        rows: plain,
+    };
+    let painted = apply_selection_to_lines(&visible, chunks[1], view.selection.as_ref());
+    frame.render_widget(Paragraph::new(painted), chunks[1]);
+    frame.render_widget(
+        Paragraph::new(Span::styled(
+            format!(" {start}–{end} / {total} · click Esc to close "),
+            Style::default().fg(Color::DarkGray),
+        )),
+        chunks[2],
+    );
+}
+
 fn line_plain_text(line: &Line<'_>) -> String {
     line.spans.iter().map(|s| s.content.as_ref()).collect()
 }
@@ -568,20 +645,24 @@ fn apply_selection_to_lines(
         .collect()
 }
 
+/// Header / chrome color for built-in agents.
+///
+/// CODE = blue, PLAN = green, RESEARCH = purple.
 fn agent_header_color(agent: &str) -> Color {
     match agent {
-        "coding" => Color::LightCyan,
-        "planning" => Color::LightYellow,
-        "researching" => Color::LightGreen,
+        "coding" | "CODE" | "CODING" => Color::Rgb(80, 160, 255), // blue
+        "planning" | "PLAN" | "PLANNING" => Color::Rgb(80, 200, 120), // green
+        "researching" | "RESEARCH" | "RESEARCHING" => Color::Rgb(180, 100, 255), // purple
         _ => Color::DarkGray,
     }
 }
 
+/// Short display label for built-in agents: CODE / PLAN / RESEARCH.
 fn agent_display(agent: &str) -> Option<&'static str> {
     match agent {
-        "coding" => Some("CODING"),
-        "planning" => Some("PLANNING"),
-        "researching" => Some("RESEARCHING"),
+        "coding" | "CODE" | "CODING" => Some("CODE"),
+        "planning" | "PLAN" | "PLANNING" => Some("PLAN"),
+        "researching" | "RESEARCH" | "RESEARCHING" => Some("RESEARCH"),
         _ => None,
     }
 }
@@ -759,6 +840,13 @@ fn estimate_row_height(row: &TranscriptLine, width: u16, prev: Option<Transcript
     };
     match row.kind {
         TranscriptKind::Assistant => rule + estimate_wrapped_lines(&row.text, width as usize),
+        TranscriptKind::User => {
+            let (prefix, _) = kind_prefix(TranscriptKind::User);
+            let content_w = (width as usize)
+                .saturating_sub(display_cols(prefix))
+                .max(1);
+            rule + user_prompt_body_line_count(&row.text, content_w)
+        }
         TranscriptKind::Spacer => 1,
         kind => {
             // Match hanging_wrap_lines exactly (word-break can exceed naive ceil).
@@ -788,6 +876,37 @@ fn estimate_row_height(row: &TranscriptLine, width: u16, prev: Option<Transcript
     }
 }
 
+/// How many screen rows a user prompt occupies after optional truncation.
+fn user_prompt_body_line_count(text: &str, content_w: usize) -> usize {
+    let full = wrap_text_chunks(text, content_w);
+    if full.len() > USER_PROMPT_MAX_FULL_LINES {
+        USER_PROMPT_TRUNCATED_BODY + 1 // 2 body lines + ellipsis
+    } else {
+        full.len().max(1)
+    }
+}
+
+/// Whether a user prompt is shown truncated at this width (click opens full popup).
+fn user_prompt_is_truncated(text: &str, width: u16) -> bool {
+    let (prefix, _) = kind_prefix(TranscriptKind::User);
+    let content_w = (width as usize)
+        .saturating_sub(display_cols(prefix))
+        .max(1);
+    wrap_text_chunks(text, content_w).len() > USER_PROMPT_MAX_FULL_LINES
+}
+
+/// Soft-wrap a user prompt; if longer than 3 lines, keep 2 and add `…`.
+fn user_prompt_wrap_chunks(text: &str, content_w: usize) -> (Vec<String>, bool) {
+    let full = wrap_text_chunks(text, content_w);
+    if full.len() > USER_PROMPT_MAX_FULL_LINES {
+        let mut out: Vec<String> = full.into_iter().take(USER_PROMPT_TRUNCATED_BODY).collect();
+        out.push("…".into());
+        (out, true)
+    } else {
+        (full, false)
+    }
+}
+
 /// Prompt lines for a user turn, optionally preceded by a separator rule.
 fn user_prompt_lines(text: &str, width: u16, with_rule: bool) -> Vec<Line<'static>> {
     let mut lines = Vec::new();
@@ -796,8 +915,45 @@ fn user_prompt_lines(text: &str, width: u16, with_rule: bool) -> Vec<Line<'stati
         lines.push(horizontal_rule_line(width));
         lines.push(Line::from(""));
     }
-    lines.extend(hanging_wrap_lines(TranscriptKind::User, text, width));
+    lines.extend(user_prompt_hanging_lines(text, width));
     lines
+}
+
+/// User prompt with hanging indent and 3-line soft cap (`…` on line 3 when truncated).
+fn user_prompt_hanging_lines(text: &str, width: u16) -> Vec<Line<'static>> {
+    let (prefix, style) = kind_prefix(TranscriptKind::User);
+    let prefix_cols = display_cols(prefix);
+    let content_w = (width as usize).saturating_sub(prefix_cols).max(1);
+    let cont_prefix = " ".repeat(prefix_cols);
+    let (chunks, _truncated) = user_prompt_wrap_chunks(text, content_w);
+    chunks
+        .into_iter()
+        .enumerate()
+        .map(|(i, chunk)| {
+            if i == 0 {
+                Line::from(vec![
+                    Span::styled(prefix.to_string(), style),
+                    Span::styled(chunk, style),
+                ])
+            } else if chunk == "…" {
+                // Dim ellipsis row — hints the prompt is expandable.
+                Line::from(vec![
+                    Span::styled(cont_prefix.clone(), style),
+                    Span::styled(
+                        "…".to_string(),
+                        Style::default()
+                            .fg(Color::DarkGray)
+                            .add_modifier(Modifier::DIM),
+                    ),
+                ])
+            } else {
+                Line::from(vec![
+                    Span::styled(cont_prefix.clone(), style),
+                    Span::styled(chunk, style),
+                ])
+            }
+        })
+        .collect()
 }
 
 // ─── On-the-fly line builders (only for the visible window) ─────────────────
@@ -1231,6 +1387,53 @@ fn collect_visible(
     out
 }
 
+/// Build click hit-rects for truncated user prompts currently on screen.
+fn collect_user_prompt_hits(
+    view: &TurnView,
+    cache: &TranscriptCache,
+    width: u16,
+    abs_start: usize,
+    body: Rect,
+) -> Vec<UserPromptHit> {
+    if cache.offsets.len() < 2 || view.transcript.is_empty() || body.height == 0 {
+        return Vec::new();
+    }
+    let abs_end = abs_start.saturating_add(body.height as usize);
+    let mut hits = Vec::new();
+    for i in 0..view.transcript.len() {
+        let row = &view.transcript[i];
+        if row.kind != TranscriptKind::User {
+            continue;
+        }
+        if !user_prompt_is_truncated(&row.text, width) {
+            continue;
+        }
+        let row_start = cache.offsets.get(i).copied().unwrap_or(0);
+        let row_end = cache.offsets.get(i + 1).copied().unwrap_or(row_start);
+        // Intersection of this transcript row with the visible absolute window.
+        let vis_start = row_start.max(abs_start);
+        let vis_end = row_end.min(abs_end);
+        if vis_start >= vis_end {
+            continue;
+        }
+        let screen_y0 = body.y.saturating_add((vis_start - abs_start) as u16);
+        let screen_h = (vis_end - vis_start) as u16;
+        if screen_h == 0 {
+            continue;
+        }
+        hits.push(UserPromptHit {
+            area: HitRect {
+                x: body.x,
+                y: screen_y0,
+                width: body.width.max(1),
+                height: screen_h,
+            },
+            full_text: row.text.clone(),
+        });
+    }
+    hits
+}
+
 /// Prewarm only the visible tail — no full-history clone needed by the caller
 /// if they pass a view locked on the draw thread. Safe to call after resume.
 pub fn prewarm_transcript_cache(view: &TurnView, width: u16) {
@@ -1248,7 +1451,7 @@ fn draw_transcript(frame: &mut Frame, area: Rect, view: &mut TurnView) {
     let width = area.width.max(20);
     let viewport = area.height as usize;
 
-    let (visible, scrolled) = TRANSCRIPT_CACHE.with(|cell| {
+    let (visible, scrolled, abs_start) = TRANSCRIPT_CACHE.with(|cell| {
         let mut cache = cell.borrow_mut();
         sync_heights(&mut cache, view, width);
 
@@ -1279,7 +1482,7 @@ fn draw_transcript(frame: &mut Frame, area: Rect, view: &mut TurnView) {
         let scrolled = !view.follow_bottom && cache.total_lines > content_rows;
 
         let visible = collect_visible(&cache, view, width, start, end);
-        (visible, scrolled)
+        (visible, scrolled, start)
     });
 
     let body_area = if scrolled {
@@ -1292,6 +1495,12 @@ fn draw_transcript(frame: &mut Frame, area: Rect, view: &mut TurnView) {
     } else {
         area
     };
+
+    // Click targets for truncated › prompts currently on screen.
+    view.user_prompt_hits = TRANSCRIPT_CACHE.with(|cell| {
+        let cache = cell.borrow();
+        collect_user_prompt_hits(view, &cache, width, abs_start, body_area)
+    });
 
     if visible.is_empty() {
         let hint = if view.status_line.is_some() {
@@ -1477,148 +1686,107 @@ fn draw_activity(frame: &mut Frame, area: Rect, view: &TurnView, tick: u64) {
     frame.render_widget(Paragraph::new(lines), area);
 }
 
-fn composer_content_width(term_width: u16) -> usize {
-    (term_width as usize)
-        .saturating_sub(COMPOSER_PREFIX_COLS)
-        .max(1)
-}
-
 fn composer_row_count(buffer: &str, term_width: u16) -> u16 {
     let w = composer_content_width(term_width);
     let n = soft_wrap_ranges(buffer, w).len().max(1);
     (n as u16).clamp(1, COMPOSER_MAX_ROWS)
 }
 
-/// Soft-wrap into byte ranges (and hard splits on `\n`).
-/// Each range is `[start, end)` into `text` (end exclusive; does not include `\n`).
-fn soft_wrap_ranges(text: &str, width: usize) -> Vec<(usize, usize)> {
-    let width = width.max(1);
-    let mut out = Vec::new();
-    if text.is_empty() {
-        out.push((0, 0));
-        return out;
-    }
-
-    let mut line_start = 0usize;
-    for (i, ch) in text.char_indices() {
-        if ch == '\n' {
-            // Flush current line (may be empty).
-            wrap_segment(text, line_start, i, width, &mut out);
-            line_start = i + ch.len_utf8();
-        }
-    }
-    // Trailing segment after last newline (or whole buffer).
-    if line_start <= text.len() {
-        // If text ends with \n, still show an empty final line for the caret.
-        if line_start == text.len() && text.ends_with('\n') {
-            out.push((line_start, line_start));
-        } else if line_start < text.len() || out.is_empty() {
-            wrap_segment(text, line_start, text.len(), width, &mut out);
-        }
-    }
-    if out.is_empty() {
-        out.push((0, 0));
-    }
-    out
-}
-
-fn wrap_segment(text: &str, start: usize, end: usize, width: usize, out: &mut Vec<(usize, usize)>) {
-    if start >= end {
-        out.push((start, start));
-        return;
-    }
-    let mut rest = start;
-    while rest < end {
-        let slice = &text[rest..end];
-        let take = slice
-            .char_indices()
-            .nth(width)
-            .map(|(i, _)| i)
-            .unwrap_or(slice.len());
-        let split = if take < slice.len() {
-            slice[..take]
-                .rfind(char::is_whitespace)
-                .filter(|&i| i > 0)
-                .unwrap_or(take)
-        } else {
-            take
-        };
-        // Guarantee forward progress even for pathologically long “words”.
-        let split = split.max(1).min(slice.len());
-        let abs_end = rest + split;
-        out.push((rest, abs_end));
-        // Skip spaces so the next visual line starts on content.
-        let mut next = abs_end;
-        while next < end {
-            let Some(c) = text[next..].chars().next() else {
-                break;
-            };
-            if c == '\n' || !c.is_whitespace() {
-                break;
-            }
-            next += c.len_utf8();
-        }
-        if next <= rest {
-            next = (rest + 1).min(end);
-        }
-        rest = next;
-    }
-}
-
-/// Map buffer caret → (visual_row, col_in_content) for the full soft-wrap layout.
-fn composer_cursor_cell(buffer: &str, cursor: usize, content_width: usize) -> (usize, usize) {
-    let cursor = cursor.min(buffer.len());
-    let ranges = soft_wrap_ranges(buffer, content_width);
-    let mut best = 0usize;
-    for (row, &(start, end)) in ranges.iter().enumerate() {
-        if start > cursor {
-            break;
-        }
-        best = row;
-        if cursor <= end {
-            let col = buffer[start..cursor].chars().count();
-            return (row, col);
-        }
-    }
-    let (start, end) = ranges[best];
-    let col = buffer[start..end.min(buffer.len())].chars().count();
-    (best, col)
-}
-
-/// Style composer text, highlighting `[Image N]` clipboard atoms in magenta.
-fn composer_content_spans(chunk: &str) -> Vec<Span<'static>> {
+/// Style composer text: image atoms magenta, selection reverse-video.
+///
+/// `# Arguments`
+/// * `chunk` — substring of the buffer for one visual row
+/// * `abs_start` — byte offset of `chunk` in the full buffer
+/// * `sel` — optional ordered half-open selection range in buffer bytes
+fn composer_content_spans(
+    chunk: &str,
+    abs_start: usize,
+    sel: Option<(usize, usize)>,
+) -> Vec<Span<'static>> {
     let white = Style::default().fg(Color::White);
     let image = Style::default()
         .fg(Color::Magenta)
         .add_modifier(Modifier::BOLD);
-    let ranges = crate::paste::image_atom_ranges(chunk);
-    if ranges.is_empty() {
-        return vec![Span::styled(chunk.to_string(), white)];
+    let selected = Style::default()
+        .fg(Color::Black)
+        .bg(Color::White)
+        .add_modifier(Modifier::BOLD);
+    let selected_image = Style::default()
+        .fg(Color::Magenta)
+        .bg(Color::White)
+        .add_modifier(Modifier::BOLD);
+
+    if chunk.is_empty() {
+        return vec![Span::styled(String::new(), white)];
     }
-    let mut spans = Vec::new();
-    let mut i = 0usize;
-    for &(start, end) in &ranges {
-        if start > i {
-            spans.push(Span::styled(chunk[i..start].to_string(), white));
+
+    // Collect split points: image-atom edges + selection edges inside this chunk.
+    let abs_end = abs_start + chunk.len();
+    let mut cuts: Vec<usize> = vec![0, chunk.len()];
+    for &(s, e) in &crate::paste::image_atom_ranges(chunk) {
+        cuts.push(s);
+        cuts.push(e);
+    }
+    if let Some((ss, se)) = sel {
+        if ss > abs_start && ss < abs_end {
+            cuts.push(ss - abs_start);
         }
-        spans.push(Span::styled(chunk[start..end].to_string(), image));
-        i = end;
+        if se > abs_start && se < abs_end {
+            cuts.push(se - abs_start);
+        }
+        // Selection covering the whole chunk still needs styling via mid checks.
     }
-    if i < chunk.len() {
-        spans.push(Span::styled(chunk[i..].to_string(), white));
+    cuts.sort_unstable();
+    cuts.dedup();
+
+    let image_ranges = crate::paste::image_atom_ranges(chunk);
+    let mut spans = Vec::new();
+    for w in cuts.windows(2) {
+        let a = w[0];
+        let b = w[1];
+        if a >= b {
+            continue;
+        }
+        let piece = &chunk[a..b];
+        let mid = abs_start + a;
+        let in_sel = sel.is_some_and(|(ss, se)| mid >= ss && mid < se);
+        let in_image = image_ranges
+            .iter()
+            .any(|&(s, e)| a >= s && a < e);
+        let style = match (in_sel, in_image) {
+            (true, true) => selected_image,
+            (true, false) => selected,
+            (false, true) => image,
+            (false, false) => white,
+        };
+        spans.push(Span::styled(piece.to_string(), style));
+    }
+    if spans.is_empty() {
+        spans.push(Span::styled(chunk.to_string(), white));
     }
     spans
 }
 
-fn draw_composer(frame: &mut Frame, area: Rect, view: &TurnView) {
+fn draw_composer(frame: &mut Frame, area: Rect, view: &mut TurnView) {
     if area.height == 0 || area.width == 0 {
+        view.composer_hit = None;
         return;
     }
+    // Hit region for mouse drag-select in the textbox.
+    view.composer_hit = Some(HitRect {
+        x: area.x,
+        y: area.y,
+        width: area.width,
+        height: area.height,
+    });
+
     let content_w = composer_content_width(area.width);
     let ranges = soft_wrap_ranges(&view.composer.buffer, content_w);
     let max_rows = area.height as usize;
     let total = ranges.len().max(1);
     let first = total.saturating_sub(max_rows);
+    view.composer_paint_first = first;
+    let sel = view.composer.selection_range();
 
     let green = Style::default()
         .fg(Color::Green)
@@ -1627,11 +1795,12 @@ fn draw_composer(frame: &mut Frame, area: Rect, view: &TurnView) {
 
     let mut lines: Vec<Line> = Vec::with_capacity(max_rows);
     for (i, &(start, end)) in ranges.iter().enumerate().skip(first).take(max_rows) {
-        let chunk = &view.composer.buffer[start..end.min(view.composer.buffer.len())];
+        let end = end.min(view.composer.buffer.len());
+        let chunk = &view.composer.buffer[start..end];
         let prefix = if i == 0 { "› " } else { "  " };
         let prefix_style = if i == 0 { green } else { white };
         let mut spans = vec![Span::styled(prefix.to_string(), prefix_style)];
-        spans.extend(composer_content_spans(chunk));
+        spans.extend(composer_content_spans(chunk, start, sel));
         lines.push(Line::from(spans));
     }
     if lines.is_empty() {
@@ -1690,6 +1859,7 @@ fn draw_footer(frame: &mut Frame, area: Rect, view: &TurnView) {
     } else {
         footer_line(&[
             ("Enter", "send"),
+            ("⌥↩", "newline"),
             ("Esc ×2", "undo"),
             ("Ctrl+C", "quit"),
         ])
@@ -1853,6 +2023,38 @@ mod tests {
             "  󰄱 Rename agent IDs from forge/muse/sage"
         ));
         assert!(!is_diff_tool_body_line("hello world"));
+    }
+
+    #[test]
+    fn user_prompt_truncates_to_two_lines_plus_ellipsis() {
+        let long = "line one\nline two\nline three\nline four\nline five";
+        let (chunks, truncated) = user_prompt_wrap_chunks(long, 80);
+        assert!(truncated);
+        assert_eq!(chunks.len(), 3);
+        assert_eq!(chunks[0], "line one");
+        assert_eq!(chunks[1], "line two");
+        assert_eq!(chunks[2], "…");
+    }
+
+    #[test]
+    fn user_prompt_keeps_three_or_fewer_lines() {
+        let short = "a\nb\nc";
+        let (chunks, truncated) = user_prompt_wrap_chunks(short, 80);
+        assert!(!truncated);
+        assert_eq!(chunks, vec!["a", "b", "c"]);
+    }
+
+    #[test]
+    fn user_prompt_height_matches_paint() {
+        let text = "one\ntwo\nthree\nfour";
+        let width = 40u16;
+        let lines = user_prompt_lines(text, width, false);
+        let row = TranscriptLine {
+            kind: TranscriptKind::User,
+            text: text.into(),
+        };
+        assert_eq!(estimate_row_height(&row, width, None), lines.len());
+        assert_eq!(lines.len(), 3); // 2 body + ellipsis
     }
 
     #[test]

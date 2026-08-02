@@ -78,6 +78,16 @@ impl Environment {
     pub fn snapshot_path(&self) -> PathBuf {
         self.base_path.join("snapshots")
     }
+
+    /// Directory for exact frame-TUI transcript snapshots (per conversation).
+    pub fn transcript_dir(&self) -> PathBuf {
+        self.base_path.join("transcripts")
+    }
+
+    /// Path of the display transcript snapshot for a conversation id string.
+    pub fn transcript_path(&self, conversation_id: &str) -> PathBuf {
+        self.transcript_dir().join(format!("{conversation_id}.json"))
+    }
     pub fn mcp_user_config(&self) -> PathBuf {
         self.base_path.join(".mcp.json")
     }

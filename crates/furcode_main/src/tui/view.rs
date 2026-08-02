@@ -5,15 +5,20 @@
 
 use std::time::{Duration, Instant};
 
+use serde::{Deserialize, Serialize};
+
 /// One immutable transcript row (user, assistant, tool summary, thought, …).
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// Serialized to disk for exact `/resume` restore (same lines as when left).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TranscriptLine {
     pub kind: TranscriptKind,
     pub text: String,
 }
 
 /// Semantic kind for styling.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum TranscriptKind {
     User,
     /// Dim clock under a user prompt (`14:32`).
@@ -72,20 +77,101 @@ impl ActivityPhase {
 }
 
 /// Bottom composer (`› …`). Always owned by the TUI surface — never by live_feed.
+///
+/// Selection is the half-open range between [`Self::sel_anchor`] and
+/// [`Self::cursor`] when the anchor is set. Typing / paste / delete replace or
+/// remove that range first.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ComposerState {
     pub buffer: String,
     pub cursor: usize,
+    /// Fixed end of an active selection; free end is [`Self::cursor`].
+    pub sel_anchor: Option<usize>,
 }
 
 impl ComposerState {
+    /// Ordered half-open selection range, if non-empty.
+    pub fn selection_range(&self) -> Option<(usize, usize)> {
+        let a = self.sel_anchor?;
+        let c = self.cursor.min(self.buffer.len());
+        let a = a.min(self.buffer.len());
+        if a == c {
+            None
+        } else {
+            Some((a.min(c), a.max(c)))
+        }
+    }
+
+    pub fn has_selection(&self) -> bool {
+        self.selection_range().is_some()
+    }
+
+    /// Borrow the selected substring, if any.
+    pub fn selected_text(&self) -> Option<&str> {
+        let (s, e) = self.selection_range()?;
+        Some(&self.buffer[s..e])
+    }
+
+    pub fn clear_selection(&mut self) {
+        self.sel_anchor = None;
+    }
+
+    /// Select the entire buffer (no-op when empty).
+    pub fn select_all(&mut self) {
+        if self.buffer.is_empty() {
+            self.sel_anchor = None;
+            self.cursor = 0;
+            return;
+        }
+        self.sel_anchor = Some(0);
+        self.cursor = self.buffer.len();
+    }
+
+    /// Delete the active selection. Returns `true` if anything was removed.
+    pub fn delete_selection(&mut self) -> bool {
+        let Some((s, e)) = self.selection_range() else {
+            return false;
+        };
+        self.buffer.replace_range(s..e, "");
+        self.cursor = s;
+        self.sel_anchor = None;
+        true
+    }
+
+    fn begin_extend(&mut self) {
+        if self.sel_anchor.is_none() {
+            self.sel_anchor = Some(self.cursor.min(self.buffer.len()));
+        }
+    }
+
+    /// Prepare for a non-extending move: collapse selection or clear it.
+    ///
+    /// `# Arguments`
+    /// * `to_start` — when collapsing, place caret at the selection start
+    ///   (`true`) or end (`false`).
+    fn collapse_or_clear(&mut self, to_start: bool) -> bool {
+        if let Some((s, e)) = self.selection_range() {
+            self.cursor = if to_start { s } else { e };
+            self.sel_anchor = None;
+            true
+        } else {
+            self.sel_anchor = None;
+            false
+        }
+    }
+
     pub fn insert_char(&mut self, c: char) {
+        self.delete_selection();
         let idx = self.cursor.min(self.buffer.len());
         self.buffer.insert(idx, c);
         self.cursor = idx + c.len_utf8();
+        self.sel_anchor = None;
     }
 
     pub fn backspace(&mut self) {
+        if self.delete_selection() {
+            return;
+        }
         if self.cursor == 0 {
             return;
         }
@@ -108,6 +194,9 @@ impl ComposerState {
 
     /// Delete the character under the caret (forward delete).
     pub fn delete_forward(&mut self) {
+        if self.delete_selection() {
+            return;
+        }
         if self.cursor >= self.buffer.len() {
             return;
         }
@@ -127,7 +216,15 @@ impl ComposerState {
     }
 
     /// Move caret one grapheme/char left.
-    pub fn move_left(&mut self) {
+    ///
+    /// `# Arguments`
+    /// * `extend` — when `true`, grow/shrink the selection (Shift+Left).
+    pub fn move_left(&mut self, extend: bool) {
+        if extend {
+            self.begin_extend();
+        } else if self.collapse_or_clear(true) {
+            return;
+        }
         if self.cursor == 0 {
             return;
         }
@@ -139,7 +236,15 @@ impl ComposerState {
     }
 
     /// Move caret one grapheme/char right.
-    pub fn move_right(&mut self) {
+    ///
+    /// `# Arguments`
+    /// * `extend` — when `true`, grow/shrink the selection (Shift+Right).
+    pub fn move_right(&mut self, extend: bool) {
+        if extend {
+            self.begin_extend();
+        } else if self.collapse_or_clear(false) {
+            return;
+        }
         if self.cursor >= self.buffer.len() {
             return;
         }
@@ -150,18 +255,100 @@ impl ComposerState {
             .unwrap_or(self.buffer.len());
     }
 
+    /// Move caret one visual row up (soft-wrap + hard newlines).
+    ///
+    /// On the first visual row, moves to the first character instead of scrolling.
+    /// Returns `false` only when already at buffer start (caller may scroll).
+    ///
+    /// `# Arguments`
+    /// * `content_width` — composer content columns (terminal width minus prefix).
+    /// * `extend` — when `true`, grow/shrink the selection (Shift+Up).
+    pub fn move_up(&mut self, content_width: usize, extend: bool) -> bool {
+        if extend {
+            self.begin_extend();
+        } else {
+            self.sel_anchor = None;
+        }
+        let ranges = soft_wrap_ranges(&self.buffer, content_width);
+        let (row, col) = composer_cursor_cell(&self.buffer, self.cursor, content_width);
+        if row == 0 {
+            // Edge: jump to the first character (Home of buffer).
+            if self.cursor == 0 {
+                return false;
+            }
+            self.cursor = 0;
+            return true;
+        }
+        let (start, end) = ranges[row - 1];
+        self.cursor = cursor_at_visual_col(&self.buffer, start, end, col);
+        true
+    }
+
+    /// Move caret one visual row down (soft-wrap + hard newlines).
+    ///
+    /// On the last visual row, moves to the last character instead of scrolling.
+    /// Returns `false` only when already at buffer end (caller may scroll).
+    ///
+    /// `# Arguments`
+    /// * `content_width` — composer content columns (terminal width minus prefix).
+    /// * `extend` — when `true`, grow/shrink the selection (Shift+Down).
+    pub fn move_down(&mut self, content_width: usize, extend: bool) -> bool {
+        if extend {
+            self.begin_extend();
+        } else {
+            self.sel_anchor = None;
+        }
+        let ranges = soft_wrap_ranges(&self.buffer, content_width);
+        let (row, col) = composer_cursor_cell(&self.buffer, self.cursor, content_width);
+        if row + 1 >= ranges.len() {
+            // Edge: jump to the last character (End of buffer).
+            if self.cursor >= self.buffer.len() {
+                return false;
+            }
+            self.cursor = self.buffer.len();
+            return true;
+        }
+        let (start, end) = ranges[row + 1];
+        self.cursor = cursor_at_visual_col(&self.buffer, start, end, col);
+        true
+    }
+
     /// Move caret to the start of the buffer.
-    pub fn move_home(&mut self) {
+    ///
+    /// `# Arguments`
+    /// * `extend` — when `true`, select through the start (Shift+Home).
+    pub fn move_home(&mut self, extend: bool) {
+        if extend {
+            self.begin_extend();
+        } else {
+            self.sel_anchor = None;
+        }
         self.cursor = 0;
     }
 
     /// Move caret to the end of the buffer.
-    pub fn move_end(&mut self) {
+    ///
+    /// `# Arguments`
+    /// * `extend` — when `true`, select through the end (Shift+End).
+    pub fn move_end(&mut self, extend: bool) {
+        if extend {
+            self.begin_extend();
+        } else {
+            self.sel_anchor = None;
+        }
         self.cursor = self.buffer.len();
     }
 
     /// Jump left to the start of the previous word (emacs/bash style).
-    pub fn move_word_left(&mut self) {
+    ///
+    /// `# Arguments`
+    /// * `extend` — when `true`, grow/shrink the selection.
+    pub fn move_word_left(&mut self, extend: bool) {
+        if extend {
+            self.begin_extend();
+        } else if self.collapse_or_clear(true) {
+            return;
+        }
         if self.cursor == 0 {
             return;
         }
@@ -179,7 +366,15 @@ impl ComposerState {
     }
 
     /// Jump right to the end of the next word.
-    pub fn move_word_right(&mut self) {
+    ///
+    /// `# Arguments`
+    /// * `extend` — when `true`, grow/shrink the selection.
+    pub fn move_word_right(&mut self, extend: bool) {
+        if extend {
+            self.begin_extend();
+        } else if self.collapse_or_clear(false) {
+            return;
+        }
         let len = self.buffer.len();
         if self.cursor >= len {
             return;
@@ -199,22 +394,28 @@ impl ComposerState {
 
     /// Delete backward to the start of the previous word (Ctrl+W / Alt+Backspace).
     pub fn delete_word_backward(&mut self) {
+        if self.delete_selection() {
+            return;
+        }
         if self.cursor == 0 {
             return;
         }
         let end = self.cursor;
-        self.move_word_left();
+        self.move_word_left(false);
         let start = self.cursor;
         self.buffer.replace_range(start..end, "");
     }
 
     /// Delete forward to the end of the next word (Alt+D).
     pub fn delete_word_forward(&mut self) {
+        if self.delete_selection() {
+            return;
+        }
         if self.cursor >= self.buffer.len() {
             return;
         }
         let start = self.cursor;
-        self.move_word_right();
+        self.move_word_right(false);
         let end = self.cursor;
         self.buffer.replace_range(start..end, "");
         self.cursor = start;
@@ -222,31 +423,221 @@ impl ComposerState {
 
     /// Insert arbitrary text at the caret (paste / bracketed paste).
     ///
-    /// Newlines are normalised to spaces so the single-line composer stays flat.
+    /// Replaces the active selection when present. Newlines are kept (multi-line
+    /// composer); tabs become spaces; `\r\n`/`\r` normalise to `\n`.
     pub fn insert_str(&mut self, text: &str) {
-        let cleaned = text.replace("\r\n", "\n").replace('\r', "\n");
-        let flat: String = cleaned
+        self.delete_selection();
+        let cleaned: String = text
+            .replace("\r\n", "\n")
+            .replace('\r', "\n")
             .chars()
-            .map(|c| if c == '\n' || c == '\t' { ' ' } else { c })
+            .map(|c| if c == '\t' { ' ' } else { c })
             .collect();
-        if flat.is_empty() {
+        if cleaned.is_empty() {
             return;
         }
         let idx = self.cursor.min(self.buffer.len());
-        self.buffer.insert_str(idx, &flat);
-        self.cursor = idx + flat.len();
+        self.buffer.insert_str(idx, &cleaned);
+        self.cursor = idx + cleaned.len();
+        self.sel_anchor = None;
     }
 
     pub fn clear(&mut self) {
         self.buffer.clear();
         self.cursor = 0;
+        self.sel_anchor = None;
     }
 
     pub fn take(&mut self) -> String {
         let s = std::mem::take(&mut self.buffer);
         self.cursor = 0;
+        self.sel_anchor = None;
         s
     }
+
+    /// Replace the entire buffer (picker complete, fork restore, …).
+    pub fn set_text(&mut self, text: impl Into<String>) {
+        self.buffer = text.into();
+        self.cursor = self.buffer.len();
+        self.sel_anchor = None;
+    }
+
+    /// Byte offset for a visual cell in the soft-wrap layout.
+    ///
+    /// `# Arguments`
+    /// * `content_width` — content columns (terminal width minus prefix)
+    /// * `abs_row` — absolute soft-wrap row index (0 = first visual line)
+    /// * `content_col` — column within the content (0 = first character column)
+    pub fn byte_at_visual(buffer: &str, content_width: usize, abs_row: usize, content_col: usize) -> usize {
+        let ranges = soft_wrap_ranges(buffer, content_width);
+        if ranges.is_empty() {
+            return 0;
+        }
+        let row = abs_row.min(ranges.len() - 1);
+        let (start, end) = ranges[row];
+        cursor_at_visual_col(buffer, start, end, content_col)
+    }
+
+    /// Click: place caret and start a (collapsed) selection anchor for drag.
+    pub fn mouse_down_at_visual(
+        &mut self,
+        content_width: usize,
+        abs_row: usize,
+        content_col: usize,
+    ) {
+        let pos = Self::byte_at_visual(&self.buffer, content_width, abs_row, content_col);
+        self.sel_anchor = Some(pos);
+        self.cursor = pos;
+    }
+
+    /// Drag free end of the selection to a visual cell.
+    pub fn mouse_drag_to_visual(
+        &mut self,
+        content_width: usize,
+        abs_row: usize,
+        content_col: usize,
+    ) {
+        if self.sel_anchor.is_none() {
+            self.sel_anchor = Some(self.cursor.min(self.buffer.len()));
+        }
+        self.cursor = Self::byte_at_visual(&self.buffer, content_width, abs_row, content_col);
+    }
+
+    /// End a mouse drag: drop a collapsed (empty) selection.
+    pub fn mouse_up_finish(&mut self) {
+        if !self.has_selection() {
+            self.sel_anchor = None;
+        }
+    }
+}
+
+/// Columns occupied by the `› ` / hanging-indent prefix in the composer.
+pub(crate) const COMPOSER_PREFIX_COLS: usize = 2;
+
+/// Content columns available for composer text (term width minus prefix).
+pub(crate) fn composer_content_width(term_width: u16) -> usize {
+    (term_width as usize)
+        .saturating_sub(COMPOSER_PREFIX_COLS)
+        .max(1)
+}
+
+/// Soft-wrap into byte ranges (and hard splits on `\n`).
+///
+/// Each range is `[start, end)` into `text` (end exclusive; does not include `\n`).
+pub(crate) fn soft_wrap_ranges(text: &str, width: usize) -> Vec<(usize, usize)> {
+    let width = width.max(1);
+    let mut out = Vec::new();
+    if text.is_empty() {
+        out.push((0, 0));
+        return out;
+    }
+
+    let mut line_start = 0usize;
+    for (i, ch) in text.char_indices() {
+        if ch == '\n' {
+            wrap_segment(text, line_start, i, width, &mut out);
+            line_start = i + ch.len_utf8();
+        }
+    }
+    // Trailing segment after last newline (or whole buffer).
+    if line_start <= text.len() {
+        // If text ends with \n, still show an empty final line for the caret.
+        if line_start == text.len() && text.ends_with('\n') {
+            out.push((line_start, line_start));
+        } else if line_start < text.len() || out.is_empty() {
+            wrap_segment(text, line_start, text.len(), width, &mut out);
+        }
+    }
+    if out.is_empty() {
+        out.push((0, 0));
+    }
+    out
+}
+
+fn wrap_segment(text: &str, start: usize, end: usize, width: usize, out: &mut Vec<(usize, usize)>) {
+    if start >= end {
+        out.push((start, start));
+        return;
+    }
+    let mut rest = start;
+    while rest < end {
+        let slice = &text[rest..end];
+        let take = slice
+            .char_indices()
+            .nth(width)
+            .map(|(i, _)| i)
+            .unwrap_or(slice.len());
+        let split = if take < slice.len() {
+            slice[..take]
+                .rfind(char::is_whitespace)
+                .filter(|&i| i > 0)
+                .unwrap_or(take)
+        } else {
+            take
+        };
+        // Guarantee forward progress even for pathologically long “words”.
+        let split = split.max(1).min(slice.len());
+        let abs_end = rest + split;
+        out.push((rest, abs_end));
+        // Skip spaces so the next visual line starts on content.
+        let mut next = abs_end;
+        while next < end {
+            let Some(c) = text[next..].chars().next() else {
+                break;
+            };
+            if c == '\n' || !c.is_whitespace() {
+                break;
+            }
+            next += c.len_utf8();
+        }
+        if next <= rest {
+            next = (rest + 1).min(end);
+        }
+        rest = next;
+    }
+}
+
+/// Map buffer caret → (visual_row, col_in_content) for the full soft-wrap layout.
+pub(crate) fn composer_cursor_cell(
+    buffer: &str,
+    cursor: usize,
+    content_width: usize,
+) -> (usize, usize) {
+    let cursor = cursor.min(buffer.len());
+    let ranges = soft_wrap_ranges(buffer, content_width);
+    let mut best = 0usize;
+    for (row, &(start, end)) in ranges.iter().enumerate() {
+        if start > cursor {
+            break;
+        }
+        best = row;
+        if cursor <= end {
+            let col = buffer[start..cursor].chars().count();
+            return (row, col);
+        }
+    }
+    let (start, end) = ranges[best];
+    let col = buffer[start..end.min(buffer.len())].chars().count();
+    (best, col)
+}
+
+/// Byte offset of the `col`-th character on a visual row, or `row_end` if shorter.
+pub(crate) fn cursor_at_visual_col(
+    buffer: &str,
+    row_start: usize,
+    row_end: usize,
+    col: usize,
+) -> usize {
+    let end = row_end.min(buffer.len());
+    let start = row_start.min(end);
+    let mut count = 0usize;
+    for (i, _) in buffer[start..end].char_indices() {
+        if count == col {
+            return start + i;
+        }
+        count += 1;
+    }
+    end
 }
 
 /// Clickable hit region in terminal cell coordinates (inclusive origin).
@@ -358,6 +749,12 @@ pub struct TurnView {
     pub last_viewport_rows: usize,
     /// Clickable "jump to latest" control (set while scrolled up).
     pub jump_bottom_hit: Option<HitRect>,
+    /// Last painted composer rect (for mouse hit-test / drag-select).
+    pub composer_hit: Option<HitRect>,
+    /// First soft-wrap row currently painted in the composer (scroll window).
+    pub composer_paint_first: usize,
+    /// True while a left-button drag started inside the composer.
+    pub composer_dragging: bool,
     /// Bumped on every transcript mutation so the renderer can cache lines.
     pub transcript_gen: u64,
     /// Transient status above the composer (loading / rendering markdown).
@@ -368,6 +765,10 @@ pub struct TurnView {
     pub history_archive: Option<super::history::HistoryArchive>,
     /// Full-screen transcript overlay (optional; not bound to a hotkey).
     pub overlay: Option<TranscriptOverlay>,
+    /// Popup showing a long user prompt in full (click truncated › row).
+    pub user_prompt_popup: Option<UserPromptPopup>,
+    /// Hit regions for truncated user prompts (set each paint of the transcript).
+    pub user_prompt_hits: Vec<UserPromptHit>,
     /// Double-Esc: pick a prior user message to fork/undo to.
     pub fork_picker: Option<ForkPicker>,
     /// Registered slash commands for the `/` picker (host refreshes on hydrate).
@@ -420,6 +821,20 @@ pub enum StatusTone {
 pub struct TranscriptOverlay {
     pub lines: Vec<TranscriptLine>,
     pub scroll_offset: usize,
+}
+
+/// Full-text user prompt viewer (opened by clicking a truncated › prompt).
+#[derive(Debug, Clone, Default)]
+pub struct UserPromptPopup {
+    pub text: String,
+    pub scroll_offset: usize,
+}
+
+/// Clickable region for a truncated user prompt in the transcript.
+#[derive(Debug, Clone)]
+pub struct UserPromptHit {
+    pub area: HitRect,
+    pub full_text: String,
 }
 
 /// One selectable user turn for double-Esc fork.
@@ -523,11 +938,16 @@ impl Default for TurnView {
             last_content_lines: 0,
             last_viewport_rows: 0,
             jump_bottom_hit: None,
+            composer_hit: None,
+            composer_paint_first: 0,
+            composer_dragging: false,
             transcript_gen: 0,
             status_line: None,
             status_tone: StatusTone::Loading,
             history_archive: None,
             overlay: None,
+            user_prompt_popup: None,
+            user_prompt_hits: Vec::new(),
             fork_picker: None,
             command_catalog: Vec::new(),
             command_picker: None,
@@ -561,8 +981,13 @@ impl TurnView {
         self.last_content_lines = 0;
         self.last_viewport_rows = 0;
         self.jump_bottom_hit = None;
+        self.composer_hit = None;
+        self.composer_paint_first = 0;
+        self.composer_dragging = false;
         self.history_archive = None;
         self.overlay = None;
+        self.user_prompt_popup = None;
+        self.user_prompt_hits.clear();
         self.fork_picker = None;
         self.command_picker = None;
         self.load_more_requested = false;
@@ -628,8 +1053,77 @@ impl TurnView {
         t.starts_with('/') || t.starts_with('!')
     }
 
+    /// Whether terminal cell `(col, row)` lies inside the painted composer.
+    pub fn hit_composer(&self, col: u16, row: u16) -> bool {
+        self.composer_hit
+            .map(|h| h.contains(col, row))
+            .unwrap_or(false)
+    }
+
+    /// Map a terminal cell to composer soft-wrap coordinates and content column.
+    ///
+    /// Returns `(abs_row, content_col)` when the cell is inside `composer_hit`.
+    fn composer_visual_at(&self, col: u16, row: u16) -> Option<(usize, usize)> {
+        let hit = self.composer_hit?;
+        // Clamp so drag-outside still updates the free end at the edge.
+        let c = col.clamp(hit.x, hit.x.saturating_add(hit.width.saturating_sub(1)));
+        let r = row.clamp(hit.y, hit.y.saturating_add(hit.height.saturating_sub(1)));
+        let rel_row = r.saturating_sub(hit.y) as usize;
+        let rel_col = c.saturating_sub(hit.x) as usize;
+        let content_col = rel_col.saturating_sub(COMPOSER_PREFIX_COLS);
+        let abs_row = self.composer_paint_first.saturating_add(rel_row);
+        Some((abs_row, content_col))
+    }
+
+    /// Left-button down inside the composer: place caret + selection anchor.
+    pub fn composer_mouse_down(&mut self, col: u16, row: u16) {
+        let Some((abs_row, content_col)) = self.composer_visual_at(col, row) else {
+            return;
+        };
+        let content_w = self
+            .composer_hit
+            .map(|h| composer_content_width(h.width))
+            .unwrap_or(40);
+        // Don't fight transcript drag-select.
+        self.selection = None;
+        self.composer_dragging = true;
+        self.composer
+            .mouse_down_at_visual(content_w, abs_row, content_col);
+        self.touch_transcript();
+    }
+
+    /// Left-button drag that started in the composer.
+    pub fn composer_mouse_drag(&mut self, col: u16, row: u16) {
+        if !self.composer_dragging {
+            return;
+        }
+        let Some((abs_row, content_col)) = self.composer_visual_at(col, row) else {
+            return;
+        };
+        let content_w = self
+            .composer_hit
+            .map(|h| composer_content_width(h.width))
+            .unwrap_or(40);
+        self.composer
+            .mouse_drag_to_visual(content_w, abs_row, content_col);
+        self.touch_transcript();
+    }
+
+    /// Left-button up after a composer drag (keeps a non-empty selection).
+    pub fn composer_mouse_up(&mut self) {
+        if !self.composer_dragging {
+            return;
+        }
+        self.composer_dragging = false;
+        self.composer.mouse_up_finish();
+        self.touch_transcript();
+    }
+
     /// Begin a drag selection at a terminal cell.
     pub fn selection_begin(&mut self, col: u16, row: u16) {
+        // Transcript select cancels any in-progress composer drag.
+        self.composer_dragging = false;
+        self.composer.clear_selection();
         let pos = CellPos { col, row };
         self.selection = Some(TextSelection {
             anchor: pos,
@@ -973,6 +1467,31 @@ impl TurnView {
         }
     }
 
+    /// Open a full-text popup for a long user prompt (click on truncated row).
+    pub fn open_user_prompt_popup(&mut self, text: impl Into<String>) {
+        self.user_prompt_popup = Some(UserPromptPopup {
+            text: text.into(),
+            scroll_offset: 0,
+        });
+        self.clear_selection();
+        self.touch_transcript();
+    }
+
+    /// Close the user-prompt popup if open.
+    pub fn close_user_prompt_popup(&mut self) {
+        if self.user_prompt_popup.take().is_some() {
+            self.touch_transcript();
+        }
+    }
+
+    /// Hit-test truncated user prompts painted in the last frame.
+    pub fn hit_user_prompt(&self, col: u16, row: u16) -> Option<&str> {
+        self.user_prompt_hits
+            .iter()
+            .find(|h| h.area.contains(col, row))
+            .map(|h| h.full_text.as_str())
+    }
+
     /// Request host to reveal older archive turns when user scrolls near top.
     pub fn maybe_request_load_more(&mut self) {
         if self.overlay.is_some() {
@@ -1025,6 +1544,11 @@ impl TurnView {
     /// Only emits when the activity phase was actually `Thinking`. Calling this
     /// again while idle is a no-op — that prevents one Thought row per markdown
     /// token when the model streams assistant text after reasoning.
+    ///
+    /// Elapsed time is always included (`Thought for 1.2s`). Consecutive
+    /// thinking segments without tools update the trailing Thought row;
+    /// after a tool/assistant row a new Thought line is pushed so each
+    /// segment keeps its own duration.
     pub fn flush_thought(&mut self) {
         let was_thinking = matches!(self.activity, ActivityPhase::Thinking { .. });
         if let ActivityPhase::Thinking { started, .. } =
@@ -1035,18 +1559,11 @@ impl TurnView {
         if !was_thinking || self.thought_acc.is_zero() {
             return;
         }
-        let secs = self.thought_acc.as_secs_f64().max(0.1);
-        let text = if secs < 60.0 {
-            format!("Thought for {secs:.1}s")
-        } else {
-            let m = (secs / 60.0).floor() as u64;
-            let s = secs - m as f64 * 60.0;
-            format!("Thought for {m}m{s:.0}s")
-        };
-        // Prefer updating the most recent thought in this activity block (may
-        // not be last if we already started assistant text — still only emit once
-        // per thinking→idle transition).
-        if let Some(last) = self.transcript.iter_mut().rev().find(|l| l.kind == TranscriptKind::Thought)
+        let text = format_thought_for_duration(self.thought_acc);
+        // Only merge into the trailing Thought row. Do not walk past tools —
+        // each post-tool thinking segment must keep its own elapsed line.
+        if let Some(last) = self.transcript.last_mut()
+            && last.kind == TranscriptKind::Thought
         {
             last.text = text;
         } else {
@@ -1055,6 +1572,8 @@ impl TurnView {
                 text,
             });
         }
+        // Next thinking segment times independently (tools already closed this one).
+        self.thought_acc = Duration::ZERO;
         self.touch_transcript();
     }
 
@@ -1478,6 +1997,23 @@ fn format_elapsed_suffix(d: Duration) -> String {
     }
 }
 
+/// User-visible thought summary including elapsed wall time.
+pub(crate) fn format_thought_for_duration(d: Duration) -> String {
+    format_thought_for_secs(d.as_secs_f64().max(0.1))
+}
+
+/// Format `Thought for 1.2s` / `Thought for 1m5s` from seconds.
+pub(crate) fn format_thought_for_secs(secs: f64) -> String {
+    let secs = secs.max(0.1);
+    if secs < 60.0 {
+        format!("Thought for {secs:.1}s")
+    } else {
+        let m = (secs / 60.0).floor() as u64;
+        let s = secs - m as f64 * 60.0;
+        format!("Thought for {m}m{s:.0}s")
+    }
+}
+
 /// Strip common ANSI CSI / OSC sequences for plain transcript display.
 fn strip_ansi_simple(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
@@ -1797,15 +2333,15 @@ mod tests {
         c.insert_char('b');
         c.insert_char('c');
         assert_eq!(c.cursor, 3);
-        c.move_left();
+        c.move_left(false);
         assert_eq!(c.cursor, 2);
-        c.move_left();
+        c.move_left(false);
         assert_eq!(c.cursor, 1);
-        c.move_home();
+        c.move_home(false);
         assert_eq!(c.cursor, 0);
-        c.move_end();
+        c.move_end(false);
         assert_eq!(c.cursor, 3);
-        c.move_left();
+        c.move_left(false);
         c.delete_forward();
         assert_eq!(c.buffer, "ab");
         assert_eq!(c.cursor, 2);
@@ -1815,23 +2351,136 @@ mod tests {
     fn test_composer_word_ops_and_paste() {
         let mut c = ComposerState::default();
         c.insert_str("hello world foo");
-        c.move_home();
-        c.move_word_right();
+        c.move_home(false);
+        c.move_word_right(false);
         assert_eq!(&c.buffer[..c.cursor], "hello ");
         c.delete_word_forward();
         assert_eq!(c.buffer, "hello foo");
-        c.move_end();
+        c.move_end(false);
         c.delete_word_backward();
         assert_eq!(c.buffer, "hello ");
         c.insert_str("bar\nbaz");
-        assert_eq!(c.buffer, "hello bar baz");
+        assert_eq!(c.buffer, "hello bar\nbaz");
+    }
+
+    #[test]
+    fn test_composer_selection_delete_and_replace() {
+        let mut c = ComposerState::default();
+        c.insert_str("hello world");
+        c.move_home(false);
+        c.move_word_right(true); // select "hello "
+        assert_eq!(c.selected_text(), Some("hello "));
+        c.backspace(); // delete selection
+        assert_eq!(c.buffer, "world");
+        assert!(!c.has_selection());
+        c.select_all();
+        assert_eq!(c.selected_text(), Some("world"));
+        c.insert_str("ok"); // replace selection
+        assert_eq!(c.buffer, "ok");
+        assert_eq!(c.cursor, 2);
+        assert!(!c.has_selection());
+    }
+
+    #[test]
+    fn test_composer_selection_collapse_on_arrow() {
+        let mut c = ComposerState::default();
+        c.insert_str("abcd");
+        c.move_home(false);
+        c.move_right(true);
+        c.move_right(true); // "ab" selected, cursor at 2
+        assert_eq!(c.selected_text(), Some("ab"));
+        c.move_left(false); // collapse to start
+        assert!(!c.has_selection());
+        assert_eq!(c.cursor, 0);
+        c.move_end(false);
+        c.move_left(true);
+        c.move_left(true); // "cd" selected from end
+        assert_eq!(c.selected_text(), Some("cd"));
+        c.move_right(false); // collapse to end
+        assert_eq!(c.cursor, 4);
+        assert!(!c.has_selection());
+    }
+
+    #[test]
+    fn test_composer_mouse_drag_select() {
+        let mut c = ComposerState::default();
+        c.insert_str("hello world");
+        let w = 40;
+        // Click at col 0 of row 0 → start of buffer.
+        c.mouse_down_at_visual(w, 0, 0);
+        assert_eq!(c.cursor, 0);
+        // Drag to col 5 → "hello" selected.
+        c.mouse_drag_to_visual(w, 0, 5);
+        assert_eq!(c.selected_text(), Some("hello"));
+        c.mouse_up_finish();
+        assert_eq!(c.selected_text(), Some("hello"));
+        // Click without drag collapses.
+        c.mouse_down_at_visual(w, 0, 6);
+        c.mouse_up_finish();
+        assert!(!c.has_selection());
+        assert_eq!(c.cursor, 6);
+    }
+
+    #[test]
+    fn test_composer_vertical_navigation_hard_lines() {
+        let mut c = ComposerState::default();
+        c.buffer = "one\ntwo\nthree".into();
+        c.cursor = c.buffer.len(); // end of "three" (col 5)
+        let w = 40;
+        // Up: col 5 on "two" (len 3) → clamp to end of line.
+        assert!(c.move_up(w, false));
+        assert_eq!(c.cursor, "one\ntwo".len());
+        // Up again: col 3 on "one" → end of "one".
+        assert!(c.move_up(w, false));
+        assert_eq!(c.cursor, "one".len());
+        // Top row, not at start → first character.
+        assert!(c.move_up(w, false));
+        assert_eq!(c.cursor, 0);
+        assert!(!c.move_up(w, false)); // already at start → caller may scroll
+        // Down preserves col 0 through the lines, then end of buffer on last.
+        assert!(c.move_down(w, false));
+        assert_eq!(&c.buffer[..c.cursor], "one\n");
+        assert!(c.move_down(w, false));
+        assert_eq!(&c.buffer[..c.cursor], "one\ntwo\n");
+        assert!(c.move_down(w, false)); // last row → jump to last character
+        assert_eq!(c.cursor, c.buffer.len());
+        assert!(!c.move_down(w, false)); // already at end
+    }
+
+    #[test]
+    fn test_composer_vertical_navigation_soft_wrap() {
+        let mut c = ComposerState::default();
+        // width 5 → "hello" / "world" (space skipped after wrap)
+        c.buffer = "hello world".into();
+        c.cursor = c.buffer.len();
+        let w = 5;
+        let ranges = soft_wrap_ranges(&c.buffer, w);
+        assert!(ranges.len() >= 2, "expected soft wrap, got {ranges:?}");
+        assert!(c.move_up(w, false));
+        let (row, _) = composer_cursor_cell(&c.buffer, c.cursor, w);
+        assert_eq!(row, 0);
+        // Top row mid-line → first character.
+        if c.cursor != 0 {
+            assert!(c.move_up(w, false));
+            assert_eq!(c.cursor, 0);
+        }
+        assert!(!c.move_up(w, false));
+        assert!(c.move_down(w, false));
+        let (row, _) = composer_cursor_cell(&c.buffer, c.cursor, w);
+        assert_eq!(row, ranges.len() - 1);
+        // Last row not at end → last character.
+        if c.cursor < c.buffer.len() {
+            assert!(c.move_down(w, false));
+            assert_eq!(c.cursor, c.buffer.len());
+        }
+        assert!(!c.move_down(w, false));
     }
 
     #[test]
     fn test_composer_image_atom_backspace_is_atomic() {
         let mut c = ComposerState::default();
         c.insert_str("see [Image 1] please");
-        c.move_end();
+        c.move_end(false);
         // Cursor after "please" — normal backspace still char-wise.
         c.backspace();
         assert_eq!(c.buffer, "see [Image 1] pleas");
@@ -1856,8 +2505,7 @@ mod tests {
     #[test]
     fn test_submit_idle_sends() {
         let mut view = TurnView::default();
-        view.composer.buffer = "hello".into();
-        view.composer.cursor = 5;
+        view.composer.set_text("hello");
         let actual = view.submit_composer();
         let expected = Some("hello".to_string());
         assert_eq!(actual, expected);
@@ -1898,8 +2546,7 @@ mod tests {
             kind: TranscriptKind::ToolDone,
             text: "Read a.rs · 0.1s".into(),
         });
-        view.composer.buffer = "later".into();
-        view.composer.cursor = 5;
+        view.composer.set_text("later");
         let actual = view.submit_composer();
         assert_eq!(actual, None);
         assert_eq!(view.pending.len(), 1);
@@ -1946,6 +2593,28 @@ mod tests {
             .collect();
         assert_eq!(thoughts.len(), 1);
         assert!(thoughts[0].text.starts_with("Thought for"));
+    }
+
+    #[test]
+    fn test_thought_after_tool_gets_own_elapsed_line() {
+        let mut view = TurnView::default();
+        view.begin_thinking();
+        view.push_reasoning("plan");
+        view.begin_tool("Read a.rs");
+        view.finish_tool(None);
+        view.begin_thinking();
+        view.push_reasoning("next");
+        view.flush_thought();
+        let thoughts: Vec<_> = view
+            .transcript
+            .iter()
+            .filter(|l| l.kind == TranscriptKind::Thought)
+            .map(|l| l.text.as_str())
+            .collect();
+        // One thought before the tool (flushed by begin_tool) + one after.
+        assert_eq!(thoughts.len(), 2);
+        assert!(thoughts[0].starts_with("Thought for"), "{}", thoughts[0]);
+        assert!(thoughts[1].starts_with("Thought for"), "{}", thoughts[1]);
     }
 
     #[test]

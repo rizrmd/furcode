@@ -295,10 +295,15 @@ fn push_user_turn(turns: &mut Vec<SlimTurn>, cur: &mut SlimTurn, prompt: String)
 }
 
 fn append_assistant_domain(out: &mut Vec<TranscriptLine>, tm: &TextMessage, env: &Environment) {
-    if tm.reasoning_details.as_ref().is_some_and(|d| !d.is_empty()) {
+    if let Some(details) = tm.reasoning_details.as_ref().filter(|d| !d.is_empty()) {
+        let chars: usize = details
+            .iter()
+            .filter_map(|d| d.text.as_ref())
+            .map(|t| t.chars().count())
+            .sum();
         out.push(TranscriptLine {
             kind: TranscriptKind::Thought,
-            text: "Thought".into(),
+            text: thought_label_from_reasoning_chars(chars),
         });
     }
     if let Some(calls) = &tm.tool_calls {
@@ -313,6 +318,22 @@ fn append_assistant_domain(out: &mut Vec<TranscriptLine>, tm: &TextMessage, env:
             text: truncate_chars(content, MAX_ASSISTANT_CHARS),
         });
     }
+}
+
+/// Rebuild a thought line with elapsed estimate from reasoning text size.
+///
+/// Context does not store wall-clock thinking time; when an exact TUI snapshot
+/// is unavailable we approximate from streamed reasoning length so the UI still
+/// shows `Thought for …s` instead of a bare `Thought`.
+fn thought_label_from_reasoning_chars(chars: usize) -> String {
+    use super::view::format_thought_for_secs;
+    if chars == 0 {
+        // Presence-only reasoning (signature without text) — still show a floor.
+        return format_thought_for_secs(0.1);
+    }
+    // ~100 chars/s wall-clock is a mid estimate for streamed reasoning.
+    let secs = (chars as f64 / 100.0).clamp(0.1, 900.0);
+    format_thought_for_secs(secs)
 }
 
 // ─── Slim turn builder (raw JSON — preferred for TUI) ───────────────────────
@@ -406,15 +427,18 @@ fn user_prompt_from_json(text: &Value) -> Option<String> {
 }
 
 fn append_assistant_json(out: &mut Vec<TranscriptLine>, text: &Value, env: &Environment) {
-    if text
-        .get("reasoning_details")
-        .and_then(|v| v.as_array())
-        .is_some_and(|a| !a.is_empty())
-    {
-        out.push(TranscriptLine {
-            kind: TranscriptKind::Thought,
-            text: "Thought".into(),
-        });
+    if let Some(details) = text.get("reasoning_details").and_then(|v| v.as_array()) {
+        if !details.is_empty() {
+            let chars: usize = details
+                .iter()
+                .filter_map(|d| d.get("text").and_then(|t| t.as_str()))
+                .map(|t| t.chars().count())
+                .sum();
+            out.push(TranscriptLine {
+                kind: TranscriptKind::Thought,
+                text: thought_label_from_reasoning_chars(chars),
+            });
+        }
     }
     if let Some(calls) = text.get("tool_calls").and_then(|v| v.as_array()) {
         for call in calls {
@@ -586,6 +610,8 @@ fn looks_like_injected_context(s: &str) -> bool {
         || h.contains("use the following summary frames")
         || h.contains("summary frames as the authoritative")
         || h.contains("pending todo items that must be completed")
+        || h.contains("stopped without a user-visible response")
+        || h.contains("stopped before finishing the user's task")
         || h.contains("files have been modified externally")
         || h.contains("authoritative reference for all coding")
         || (s.starts_with('<') && s.len() > 200 && s.contains("</") && !h.contains("<task>") && !h.contains("<feedback>"))

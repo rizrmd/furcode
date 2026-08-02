@@ -10,8 +10,8 @@ use crate::apply_tunable_parameters::ApplyTunableParameters;
 use crate::changed_files::ChangedFiles;
 use crate::dto::ToolsOverview;
 use crate::hooks::{
-    CompactionHandler, DoomLoopDetector, PendingTodosHandler, TitleGenerationHandler,
-    TracingHandler,
+    CompactionHandler, DoomLoopDetector, PendingTodosHandler, PrematureCompletionHandler,
+    TitleGenerationHandler, TracingHandler,
 };
 use crate::init_conversation_metrics::InitConversationMetrics;
 use crate::orch::Orchestrator;
@@ -148,15 +148,19 @@ impl<S: Services + EnvironmentInfra<Config = furcode_config::FurcodeConfig>> Fur
         let tracing_handler = TracingHandler::new();
         let title_handler = TitleGenerationHandler::new(services.clone());
 
-        // Build the on_end hook, conditionally adding PendingTodosHandler based on
-        // config
-        let on_end_hook = if furcode_config.verify_todos {
-            tracing_handler
-                .clone()
-                .and(title_handler.clone())
-                .and(PendingTodosHandler::new())
-        } else {
-            tracing_handler.clone().and(title_handler.clone())
+        // Build the on_end hook:
+        // - PendingTodosHandler (config) blocks stop while todos remain
+        // - PrematureCompletionHandler nudges once on empty stop-after-tools
+        // Both inject system messages so the orch loop continues; anti-loop is
+        // one nudge each + max_requests_per_turn + doom-loop detector.
+        let on_end_hook = {
+            let base = tracing_handler.clone().and(title_handler.clone());
+            let with_todos = if furcode_config.verify_todos {
+                base.and(PendingTodosHandler::new())
+            } else {
+                base
+            };
+            with_todos.and(PrematureCompletionHandler::new())
         };
 
         let hook = Hook::default()

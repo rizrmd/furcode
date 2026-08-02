@@ -727,3 +727,98 @@ async fn test_complete_when_empty_todos() {
         "Should have TaskComplete when no todos exist"
     );
 }
+
+#[tokio::test]
+async fn test_empty_stop_after_tools_injects_premature_completion_reminder() {
+    // Model uses tools then stops with empty content → nudge once and continue.
+    let tool_call = ToolCallFull::new("fs_read")
+        .arguments(ToolCallArguments::from(json!({"path": "test.txt"})));
+    let tool_result = ToolResult::new("fs_read").output(Ok(ToolOutput::text("file content")));
+
+    let mut ctx = TestContext::default()
+        .mock_tool_call_responses(vec![(tool_call.clone(), tool_result)])
+        .mock_assistant_responses(vec![
+            ChatCompletionMessage::assistant("")
+                .tool_calls(vec![tool_call.into()])
+                .finish_reason(FinishReason::Stop),
+            // Empty final after tools — End hook injects reminder, loop continues
+            ChatCompletionMessage::assistant("")
+                .finish_reason(FinishReason::Stop),
+            // After one nudge, second empty stop is allowed to complete
+            ChatCompletionMessage::assistant(Content::full("Here is the status."))
+                .finish_reason(FinishReason::Stop),
+        ]);
+
+    ctx.run("Implement auto update from the plan").await.unwrap();
+
+    let messages = ctx.output.context_messages();
+    let reminder = messages
+        .iter()
+        .filter_map(|entry| entry.message.content())
+        .find(|content| {
+            content.contains("stopped without a user-visible response")
+                || content.contains("stopped before finishing the user's task")
+        });
+
+    assert!(
+        reminder.is_some(),
+        "Should inject premature-completion reminder after empty stop with tools"
+    );
+
+    let has_task_complete = ctx
+        .output
+        .chat_responses
+        .iter()
+        .filter_map(|r| r.as_ref().ok())
+        .any(|response| matches!(response, ChatResponse::TaskComplete));
+    assert!(
+        has_task_complete,
+        "Should eventually TaskComplete after model provides content"
+    );
+}
+
+#[tokio::test]
+async fn test_empty_stop_after_tools_allows_complete_after_one_nudge() {
+    // Anti-loop: only one premature-completion reminder. Second empty stop ends.
+    let tool_call = ToolCallFull::new("fs_read")
+        .arguments(ToolCallArguments::from(json!({"path": "test.txt"})));
+    let tool_result = ToolResult::new("fs_read").output(Ok(ToolOutput::text("file content")));
+
+    let mut ctx = TestContext::default()
+        .mock_tool_call_responses(vec![(tool_call.clone(), tool_result)])
+        .mock_assistant_responses(vec![
+            ChatCompletionMessage::assistant("")
+                .tool_calls(vec![tool_call.into()])
+                .finish_reason(FinishReason::Stop),
+            ChatCompletionMessage::assistant("")
+                .finish_reason(FinishReason::Stop),
+            // After nudge, still empty — must complete (no infinite loop)
+            ChatCompletionMessage::assistant("")
+                .finish_reason(FinishReason::Stop),
+        ]);
+
+    ctx.run("Do the work").await.unwrap();
+
+    let reminder_count = ctx
+        .output
+        .context_messages()
+        .iter()
+        .filter_map(|entry| entry.message.content())
+        .filter(|content| {
+            content.contains("stopped without a user-visible response")
+                || content.contains("stopped before finishing the user's task")
+        })
+        .count();
+    assert_eq!(reminder_count, 1, "Must inject at most one premature-completion nudge");
+
+    let has_task_complete = ctx
+        .output
+        .chat_responses
+        .iter()
+        .filter_map(|r| r.as_ref().ok())
+        .any(|response| matches!(response, ChatResponse::TaskComplete));
+    assert!(
+        has_task_complete,
+        "Second empty stop after nudge must TaskComplete (anti-loop)"
+    );
+}

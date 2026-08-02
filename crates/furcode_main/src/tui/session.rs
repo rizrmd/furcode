@@ -367,6 +367,14 @@ fn run_draw(
                                 } else {
                                     ov.scroll_offset = ov.scroll_offset.saturating_sub(step);
                                 }
+                            } else if let Some(popup) = v.user_prompt_popup.as_mut() {
+                                if up {
+                                    popup.scroll_offset =
+                                        popup.scroll_offset.saturating_add(step);
+                                } else {
+                                    popup.scroll_offset =
+                                        popup.scroll_offset.saturating_sub(step);
+                                }
                             } else {
                                 v.scroll_page(up);
                                 v.maybe_request_load_more();
@@ -439,26 +447,49 @@ fn run_draw(
                             if hit.contains(me.column, me.row) {
                                 v.scroll_to_bottom();
                                 v.clear_selection();
+                                v.composer_dragging = false;
                                 needs_draw = true;
                                 // skip starting a selection on the jump bar
+                            } else if v.hit_composer(me.column, me.row) {
+                                v.composer_mouse_down(me.column, me.row);
+                                needs_draw = true;
+                            } else if let Some(full) = v.hit_user_prompt(me.column, me.row) {
+                                // Expand truncated › prompt (3+ soft-wrap lines).
+                                let text = full.to_string();
+                                v.open_user_prompt_popup(text);
+                                needs_draw = true;
                             } else {
                                 v.selection_begin(me.column, me.row);
                                 needs_draw = true;
                             }
+                        } else if v.hit_composer(me.column, me.row) {
+                            v.composer_mouse_down(me.column, me.row);
+                            needs_draw = true;
+                        } else if let Some(full) = v.hit_user_prompt(me.column, me.row) {
+                            let text = full.to_string();
+                            v.open_user_prompt_popup(text);
+                            needs_draw = true;
                         } else {
                             v.selection_begin(me.column, me.row);
                             needs_draw = true;
                         }
                     }
                     MouseEventKind::Drag(event::MouseButton::Left) => {
-                        view.lock()
-                            .unwrap_or_else(|e| e.into_inner())
-                            .selection_update(me.column, me.row);
+                        let mut v = view.lock().unwrap_or_else(|e| e.into_inner());
+                        if v.composer_dragging {
+                            v.composer_mouse_drag(me.column, me.row);
+                        } else {
+                            v.selection_update(me.column, me.row);
+                        }
                         needs_draw = true;
                     }
                     MouseEventKind::Up(event::MouseButton::Left) => {
                         let mut v = view.lock().unwrap_or_else(|e| e.into_inner());
-                        if let Some(text) = v.selection_end() {
+                        if v.composer_dragging {
+                            // Keep selection for delete / copy / paste-replace.
+                            // (Unlike transcript drag, do not auto-copy.)
+                            v.composer_mouse_up();
+                        } else if let Some(text) = v.selection_end() {
                             clipboard_set(&text);
                             v.toast_copied(&text);
                         }
@@ -480,6 +511,15 @@ fn run_draw(
                     ov.scroll_offset = ov.scroll_offset.saturating_add(scroll_delta as usize);
                 } else {
                     ov.scroll_offset = ov
+                        .scroll_offset
+                        .saturating_sub((-scroll_delta) as usize);
+                }
+            } else if let Some(popup) = v.user_prompt_popup.as_mut() {
+                if scroll_delta > 0 {
+                    popup.scroll_offset =
+                        popup.scroll_offset.saturating_add(scroll_delta as usize);
+                } else {
+                    popup.scroll_offset = popup
                         .scroll_offset
                         .saturating_sub((-scroll_delta) as usize);
                 }
@@ -582,8 +622,7 @@ fn handle_key(
                         .cloned()
                     {
                         let insert = format!("{} ", item.name);
-                        v.composer.buffer = insert.clone();
-                        v.composer.cursor = insert.len();
+                        v.composer.set_text(insert);
                         v.command_picker = None;
                         v.touch_transcript();
                     }
@@ -600,8 +639,7 @@ fn handle_key(
                     if let Some(name) = selected {
                         // Put the chosen command in the composer and submit via the
                         // normal path (handles busy → sticky queue correctly).
-                        v.composer.buffer = name;
-                        v.composer.cursor = v.composer.buffer.len();
+                        v.composer.set_text(name);
                     }
                     v.scroll_to_bottom();
                     if let Some(msg) = v.submit_composer() {
@@ -643,11 +681,19 @@ fn handle_key(
                 }
                 // Left/Right still move the caret inside the `/query` token.
                 (KeyCode::Left, m) if m == KeyModifiers::NONE => {
-                    v.composer.move_left();
+                    v.composer.move_left(false);
                     return Ok(KeyResult::Changed);
                 }
                 (KeyCode::Right, m) if m == KeyModifiers::NONE => {
-                    v.composer.move_right();
+                    v.composer.move_right(false);
+                    return Ok(KeyResult::Changed);
+                }
+                (KeyCode::Left, m) if m == KeyModifiers::SHIFT => {
+                    v.composer.move_left(true);
+                    return Ok(KeyResult::Changed);
+                }
+                (KeyCode::Right, m) if m == KeyModifiers::SHIFT => {
+                    v.composer.move_right(true);
                     return Ok(KeyResult::Changed);
                 }
                 _ => return Ok(KeyResult::Ignored),
@@ -710,15 +756,19 @@ fn handle_key(
         }
     }
 
-    // Overlay swallows most keys.
+    // Overlay / user-prompt popup swallow most keys.
     {
         let mut v = view.lock().unwrap_or_else(|e| e.into_inner());
-        if v.overlay.is_some() {
+        if v.overlay.is_some() || v.user_prompt_popup.is_some() {
             match (code, modifiers) {
                 (KeyCode::Char('c'), KeyModifiers::CONTROL)
                 | (KeyCode::Char('q'), KeyModifiers::CONTROL) => return Ok(KeyResult::Quit),
                 (KeyCode::Esc, _) | (KeyCode::Char('q'), KeyModifiers::NONE) => {
-                    v.close_overlay();
+                    if v.user_prompt_popup.is_some() {
+                        v.close_user_prompt_popup();
+                    } else {
+                        v.close_overlay();
+                    }
                     return Ok(KeyResult::Changed);
                 }
                 (KeyCode::PageUp, _) | (KeyCode::Up, _) => {
@@ -731,12 +781,16 @@ fn handle_key(
                     if let Some(ov) = v.overlay.as_mut() {
                         let max = ov.lines.len().saturating_sub(1);
                         ov.scroll_offset = max;
+                    } else if let Some(popup) = v.user_prompt_popup.as_mut() {
+                        popup.scroll_offset = usize::MAX / 4; // clamp in draw
                     }
                     return Ok(KeyResult::Changed);
                 }
                 (KeyCode::End, _) => {
                     if let Some(ov) = v.overlay.as_mut() {
                         ov.scroll_offset = 0;
+                    } else if let Some(popup) = v.user_prompt_popup.as_mut() {
+                        popup.scroll_offset = 0;
                     }
                     return Ok(KeyResult::Changed);
                 }
@@ -746,14 +800,91 @@ fn handle_key(
     }
 
     match (code, modifiers) {
-        (KeyCode::Char('c'), KeyModifiers::CONTROL)
-        | (KeyCode::Char('q'), KeyModifiers::CONTROL) => Ok(KeyResult::Quit),
+        (KeyCode::Char('q'), KeyModifiers::CONTROL) => Ok(KeyResult::Quit),
+        // Ctrl+C: copy composer selection when present; otherwise quit.
+        (KeyCode::Char('c' | 'C'), m)
+            if m.contains(KeyModifiers::CONTROL) || m.contains(KeyModifiers::SUPER) =>
+        {
+            let mut v = view.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(text) = v.composer.selected_text().map(str::to_owned) {
+                drop(v);
+                clipboard_set(&text);
+                Ok(KeyResult::Changed)
+            } else if m.contains(KeyModifiers::CONTROL)
+                && !m.contains(KeyModifiers::SUPER)
+                && !m.contains(KeyModifiers::ALT)
+                && !m.contains(KeyModifiers::SHIFT)
+            {
+                Ok(KeyResult::Quit)
+            } else {
+                Ok(KeyResult::Ignored)
+            }
+        }
+        // Cut selection (Ctrl/Cmd+X).
+        (KeyCode::Char('x' | 'X'), m)
+            if m.contains(KeyModifiers::CONTROL) || m.contains(KeyModifiers::SUPER) =>
+        {
+            let mut v = view.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(text) = v.composer.selected_text().map(str::to_owned) {
+                clipboard_set(&text);
+                v.composer.delete_selection();
+                v.sync_command_picker_from_composer();
+                Ok(KeyResult::Changed)
+            } else {
+                Ok(KeyResult::Ignored)
+            }
+        }
+        // Select all (Ctrl/Cmd+A). Home still jumps to buffer start.
+        (KeyCode::Char('a' | 'A'), m)
+            if m.contains(KeyModifiers::CONTROL) || m.contains(KeyModifiers::SUPER) =>
+        {
+            view.lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .composer
+                .select_all();
+            Ok(KeyResult::Changed)
+        }
         (KeyCode::PageUp, _) => Ok(KeyResult::ScrollPage { up: true }),
         (KeyCode::PageDown, _) => Ok(KeyResult::ScrollPage { up: false }),
-        // Arrow / Shift / Alt / Ctrl + Up|Down all scroll the transcript.
-        // (Composer is single-caret; Up/Down are free for scrolling.)
+        // Plain ↑/↓: move caret. Shift+↑/↓: extend selection. Other modifiers
+        // scroll the transcript. On the first/last visual row, jump to
+        // start/end; only scroll when already at that edge.
+        (KeyCode::Up, m) if m == KeyModifiers::NONE || m == KeyModifiers::SHIFT => {
+            let extend = m.contains(KeyModifiers::SHIFT);
+            let content_w = composer_term_content_width();
+            let mut v = view.lock().unwrap_or_else(|e| e.into_inner());
+            if v.composer.move_up(content_w, extend) {
+                Ok(KeyResult::Changed)
+            } else if extend {
+                Ok(KeyResult::Changed)
+            } else {
+                Ok(KeyResult::ScrollLines { up: true, lines: 3 })
+            }
+        }
+        (KeyCode::Down, m) if m == KeyModifiers::NONE || m == KeyModifiers::SHIFT => {
+            let extend = m.contains(KeyModifiers::SHIFT);
+            let content_w = composer_term_content_width();
+            let mut v = view.lock().unwrap_or_else(|e| e.into_inner());
+            if v.composer.move_down(content_w, extend) {
+                Ok(KeyResult::Changed)
+            } else if extend {
+                Ok(KeyResult::Changed)
+            } else {
+                Ok(KeyResult::ScrollLines {
+                    up: false,
+                    lines: 3,
+                })
+            }
+        }
         (KeyCode::Up, _) => Ok(KeyResult::ScrollLines { up: true, lines: 3 }),
         (KeyCode::Down, _) => Ok(KeyResult::ScrollLines { up: false, lines: 3 }),
+        (KeyCode::End, m) if m.contains(KeyModifiers::SHIFT) => {
+            view.lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .composer
+                .move_end(true);
+            Ok(KeyResult::Changed)
+        }
         (KeyCode::End, m)
             if m.contains(KeyModifiers::CONTROL) || m == KeyModifiers::NONE =>
         {
@@ -761,7 +892,7 @@ fn handle_key(
             if !v.is_at_bottom() || m.contains(KeyModifiers::CONTROL) {
                 v.scroll_to_bottom();
             } else {
-                v.composer.move_end();
+                v.composer.move_end(false);
             }
             Ok(KeyResult::Changed)
         }
@@ -804,6 +935,13 @@ fn handle_key(
             }
             Ok(KeyResult::Changed)
         }
+        // Alt/Option+Enter inserts a hard newline (multi-line draft).
+        (KeyCode::Enter, m) if m.contains(KeyModifiers::ALT) => {
+            let mut v = view.lock().unwrap_or_else(|e| e.into_inner());
+            v.composer.insert_char('\n');
+            v.sync_command_picker_from_composer();
+            Ok(KeyResult::Changed)
+        }
         (KeyCode::Enter, _) => {
             let mut v = view.lock().unwrap_or_else(|e| e.into_inner());
             v.command_picker = None;
@@ -843,12 +981,32 @@ fn handle_key(
             Ok(KeyResult::Changed)
         }
         (KeyCode::Left, m)
+            if (m.contains(KeyModifiers::ALT) || m.contains(KeyModifiers::CONTROL))
+                && m.contains(KeyModifiers::SHIFT) =>
+        {
+            view.lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .composer
+                .move_word_left(true);
+            Ok(KeyResult::Changed)
+        }
+        (KeyCode::Right, m)
+            if (m.contains(KeyModifiers::ALT) || m.contains(KeyModifiers::CONTROL))
+                && m.contains(KeyModifiers::SHIFT) =>
+        {
+            view.lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .composer
+                .move_word_right(true);
+            Ok(KeyResult::Changed)
+        }
+        (KeyCode::Left, m)
             if m.contains(KeyModifiers::ALT) || m.contains(KeyModifiers::CONTROL) =>
         {
             view.lock()
                 .unwrap_or_else(|e| e.into_inner())
                 .composer
-                .move_word_left();
+                .move_word_left(false);
             Ok(KeyResult::Changed)
         }
         (KeyCode::Right, m)
@@ -857,7 +1015,7 @@ fn handle_key(
             view.lock()
                 .unwrap_or_else(|e| e.into_inner())
                 .composer
-                .move_word_right();
+                .move_word_right(false);
             Ok(KeyResult::Changed)
         }
         (KeyCode::Backspace, _) => {
@@ -872,39 +1030,53 @@ fn handle_key(
             v.sync_command_picker_from_composer();
             Ok(KeyResult::Changed)
         }
+        (KeyCode::Left, m) if m.contains(KeyModifiers::SHIFT) => {
+            view.lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .composer
+                .move_left(true);
+            Ok(KeyResult::Changed)
+        }
+        (KeyCode::Right, m) if m.contains(KeyModifiers::SHIFT) => {
+            view.lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .composer
+                .move_right(true);
+            Ok(KeyResult::Changed)
+        }
         (KeyCode::Left, _) => {
             view.lock()
                 .unwrap_or_else(|e| e.into_inner())
                 .composer
-                .move_left();
+                .move_left(false);
             Ok(KeyResult::Changed)
         }
         (KeyCode::Right, _) => {
             view.lock()
                 .unwrap_or_else(|e| e.into_inner())
                 .composer
-                .move_right();
+                .move_right(false);
+            Ok(KeyResult::Changed)
+        }
+        (KeyCode::Home, m) if m.contains(KeyModifiers::SHIFT) => {
+            view.lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .composer
+                .move_home(true);
             Ok(KeyResult::Changed)
         }
         (KeyCode::Home, _) => {
             view.lock()
                 .unwrap_or_else(|e| e.into_inner())
                 .composer
-                .move_home();
-            Ok(KeyResult::Changed)
-        }
-        (KeyCode::Char('a'), KeyModifiers::CONTROL) => {
-            view.lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .composer
-                .move_home();
+                .move_home(false);
             Ok(KeyResult::Changed)
         }
         (KeyCode::Char('e'), KeyModifiers::CONTROL) => {
             view.lock()
                 .unwrap_or_else(|e| e.into_inner())
                 .composer
-                .move_end();
+                .move_end(false);
             Ok(KeyResult::Changed)
         }
         (KeyCode::Char('w'), KeyModifiers::CONTROL) => {
@@ -929,14 +1101,14 @@ fn handle_key(
             view.lock()
                 .unwrap_or_else(|e| e.into_inner())
                 .composer
-                .move_word_left();
+                .move_word_left(false);
             Ok(KeyResult::Changed)
         }
         (KeyCode::Char('f'), m) if m.contains(KeyModifiers::ALT) => {
             view.lock()
                 .unwrap_or_else(|e| e.into_inner())
                 .composer
-                .move_word_right();
+                .move_word_right(false);
             Ok(KeyResult::Changed)
         }
         (KeyCode::Char('v' | 'V'), m)
@@ -977,4 +1149,12 @@ fn handle_key(
         }
         _ => Ok(KeyResult::Ignored),
     }
+}
+
+/// Content width for composer caret math, matching the draw layout.
+fn composer_term_content_width() -> usize {
+    let term_w = crossterm::terminal::size()
+        .map(|(w, _)| w)
+        .unwrap_or(80);
+    super::view::composer_content_width(term_w)
 }

@@ -3,7 +3,7 @@ use std::sync::Arc;
 
 use furcode_domain::{
     Attachment, ChatCompletionMessage, ChatResponse, Conversation, ConversationId, Environment,
-    Event, Hook, ProviderId, ToolCallFull, ToolErrorTracker, ToolResult,
+    Event, EventHandleExt, Hook, ProviderId, ToolCallFull, ToolErrorTracker, ToolResult,
 };
 use handlebars::{Handlebars, no_escape};
 use include_dir::{Dir, include_dir};
@@ -12,7 +12,7 @@ use tokio::sync::Mutex;
 pub use super::orch_setup::TestContext;
 use crate::app::build_template_config;
 use crate::apply_tunable_parameters::ApplyTunableParameters;
-use crate::hooks::{DoomLoopDetector, PendingTodosHandler};
+use crate::hooks::{DoomLoopDetector, PendingTodosHandler, PrematureCompletionHandler};
 use crate::init_conversation_metrics::InitConversationMetrics;
 use crate::orch::Orchestrator;
 use crate::set_conversation_id::SetConversationId;
@@ -135,7 +135,9 @@ impl Runner {
             .hook(Arc::new(
                 Hook::default()
                     .on_request(DoomLoopDetector::default())
-                    .on_end(PendingTodosHandler::new()),
+                    .on_end(
+                        PendingTodosHandler::new().and(PrematureCompletionHandler::new()),
+                    ),
             ))
             .sender(tx);
 

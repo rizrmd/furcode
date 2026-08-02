@@ -1,7 +1,6 @@
 use std::sync::Arc;
 
 use anyhow::Context;
-use convert_case::{Case, Casing};
 use furcode_domain::{
     AgentId, ChatRequest, ChatResponse, ChatResponseContent, Conversation, ConversationId, Event,
     TitleFormat, ToolCallContext, ToolDefinition, ToolName, ToolOutput,
@@ -46,12 +45,27 @@ impl<S: Services + EnvironmentInfra<Config = furcode_config::FurcodeConfig>> Age
         ctx: &ToolCallContext,
         conversation_id: Option<ConversationId>,
     ) -> anyhow::Result<ToolOutput> {
+        // Enter that agent's mode for the rest of the session (e.g. coding →
+        // planning when the model launches the planning agent without `/plan`).
+        // Best-effort: failure here must not block the delegated run.
+        if let Err(err) = self.services.set_active_agent_id(agent_id.clone()).await {
+            tracing::warn!(
+                error = %err,
+                agent_id = %agent_id,
+                "Failed to set active agent when launching agent tool"
+            );
+        }
+
+        // Short chrome labels: CODE / PLAN / RESEARCH (ids stay coding/planning/researching).
+        let mode_label = match agent_id.as_str() {
+            "coding" => "CODE",
+            "planning" => "PLAN",
+            "researching" => "RESEARCH",
+            other => other,
+        };
+        // Title contains "[Agent]" so the TUI can refresh the header to this mode.
         ctx.send_tool_input(
-            TitleFormat::debug(format!(
-                "{} [Agent]",
-                agent_id.as_str().to_case(Case::UpperSnake)
-            ))
-            .sub_title(task.as_str()),
+            TitleFormat::debug(format!("{mode_label} [Agent]")).sub_title(task.as_str()),
         )
         .await?;
 
