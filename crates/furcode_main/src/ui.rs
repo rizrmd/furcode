@@ -5553,6 +5553,11 @@ impl<A: API + ConsoleWriter + 'static, F: Fn(FurcodeConfig) -> A + Send + Sync> 
         if let Some(ref model) = model {
             tracker::set_model(model.to_string());
         }
+        // Invalidate the cached context length so that the next
+        // ensure_context_length call re-resolves the window for the
+        // newly active model rather than returning a stale value.
+        self.state.context_length = None;
+        self.state.context_length_model = None;
     }
 
     async fn on_custom_event(&mut self, event: Event) -> Result<()> {
