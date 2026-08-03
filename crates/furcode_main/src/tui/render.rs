@@ -568,20 +568,23 @@ fn apply_selection_to_lines(
         .collect()
 }
 
+/// Header/chrome color for a built-in agent id (or its short display label).
 fn agent_header_color(agent: &str) -> Color {
+    // CODE = blue, PLAN = green, RESEARCH = purple
     match agent {
-        "coding" => Color::LightCyan,
-        "planning" => Color::LightYellow,
-        "researching" => Color::LightGreen,
+        "coding" | "CODE" => Color::Rgb(80, 160, 255),
+        "planning" | "PLAN" => Color::Rgb(80, 200, 120),
+        "researching" | "RESEARCH" => Color::Rgb(180, 100, 255),
         _ => Color::DarkGray,
     }
 }
 
+/// Short display label for a built-in agent id.
 fn agent_display(agent: &str) -> Option<&'static str> {
     match agent {
-        "coding" => Some("CODING"),
-        "planning" => Some("PLANNING"),
-        "researching" => Some("RESEARCHING"),
+        "coding" | "CODE" => Some("CODE"),
+        "planning" | "PLAN" => Some("PLAN"),
+        "researching" | "RESEARCH" => Some("RESEARCH"),
         _ => None,
     }
 }
@@ -1675,7 +1678,7 @@ fn footer_line(pairs: &[(&str, &str)]) -> Line<'static> {
 
 fn draw_footer(frame: &mut Frame, area: Rect, view: &TurnView) {
     // Short key:action chips — brighter gray than the old DarkGray prose.
-    let line = if !view.is_at_bottom() {
+    let keys = if !view.is_at_bottom() {
         footer_line(&[
             ("End", "latest"),
             ("Esc ×2", "undo"),
@@ -1694,6 +1697,38 @@ fn draw_footer(frame: &mut Frame, area: Rect, view: &TurnView) {
             ("Ctrl+C", "quit"),
         ])
     };
+
+    // Right-align context fill (e.g. `░0.65%`) so it sits next to the composer.
+    let line = if let Some(ctx) = view.context_usage.as_deref() {
+        let keys_width: usize = keys
+            .spans
+            .iter()
+            .map(|s| s.content.chars().count())
+            .sum();
+        let ctx_width = ctx.chars().count();
+        let pad = (area.width as usize)
+            .saturating_sub(keys_width)
+            .saturating_sub(ctx_width)
+            .max(1);
+        let ratio = view.context_usage_ratio.unwrap_or(0.0);
+        let ctx_color = if ratio >= 0.85 {
+            Color::LightRed
+        } else if ratio >= 0.70 {
+            Color::Yellow
+        } else {
+            Color::Gray
+        };
+        let mut spans = keys.spans;
+        spans.push(Span::raw(" ".repeat(pad)));
+        spans.push(Span::styled(
+            ctx.to_string(),
+            Style::default().fg(ctx_color),
+        ));
+        Line::from(spans)
+    } else {
+        keys
+    };
+
     frame.render_widget(Paragraph::new(line), area);
 }
 

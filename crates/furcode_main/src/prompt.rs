@@ -8,7 +8,7 @@ use furcode_api::{AgentId, Effort, ModelId, Usage};
 use nu_ansi_term::{Color, Style};
 
 use crate::display_constants::markers;
-use crate::utils::humanize_number;
+use crate::utils::{format_context_usage, humanize_number};
 
 /// Terminal width at which the reasoning effort label switches from the
 /// compact three-letter form (e.g. `MED`) to the full uppercase label.
@@ -21,7 +21,7 @@ const WIDE_TERMINAL_THRESHOLD: usize = 100;
 /// ```text
 ///   forgecode · main
 ///   › _
-///                                    FURCODE  12.4k  $0.08  claude-sonnet-4
+///                          CODE  12.4k  ░0.65%  $0.08  claude-sonnet-4
 /// ```
 #[derive(Clone, Setters)]
 #[setters(strip_option, borrow_self)]
@@ -30,6 +30,8 @@ pub struct FurcodePrompt {
     pub usage: Option<Usage>,
     pub agent_id: AgentId,
     pub model: Option<ModelId>,
+    /// Active model context window (tokens). Used with usage to show fill %.
+    pub context_length: Option<u64>,
     /// Currently configured reasoning effort level for the active model.
     /// `Effort::None` is suppressed in rendering.
     pub reasoning_effort: Option<Effort>,
@@ -46,6 +48,7 @@ impl FurcodePrompt {
             usage: None,
             agent_id,
             model: None,
+            context_length: None,
             reasoning_effort: None,
             git_branch,
         }
@@ -87,18 +90,19 @@ impl FurcodePrompt {
         let total_tokens = self.usage.as_ref().map(|u| u.total_tokens);
         let active = total_tokens.map(|t| *t > 0).unwrap_or(false);
 
+        // CODE = blue, PLAN = green, RESEARCH = purple
         let agent_color = match self.agent_id.as_str() {
-            "coding" => Color::LightCyan,
-            "planning" => Color::LightYellow,
-            "researching" => Color::LightGreen,
+            "coding" => Color::Rgb(80, 160, 255),
+            "planning" => Color::Rgb(80, 200, 120),
+            "researching" => Color::Rgb(180, 100, 255),
             _ => Color::LightGray,
         };
         let mut result = String::with_capacity(64);
 
         let agent_str = match self.agent_id.as_str() {
-            "coding" => "CODING".to_string(),
-            "planning" => "PLANNING".to_string(),
-            "researching" => "RESEARCHING".to_string(),
+            "coding" => "CODE".to_string(),
+            "planning" => "PLAN".to_string(),
+            "researching" => "RESEARCH".to_string(),
             other => other.to_case(Case::UpperSnake),
         };
         write!(
@@ -122,6 +126,15 @@ impl FurcodePrompt {
                 Style::new().bold().fg(Color::LightGray).paint(count_str)
             )
             .unwrap();
+
+            // Compact context fill: e.g. `█0.65%` (glyph + 5-char percent).
+            if let Some(limit) = self.context_length
+                && let Some(indicator) = format_context_usage(*tokens, limit)
+            {
+                let ratio = *tokens as f64 / limit as f64;
+                let color = context_usage_color(ratio, active);
+                write!(result, " {}", Style::new().fg(color).paint(indicator)).unwrap();
+            }
         }
 
         if let Some(cost) = self.usage.as_ref().and_then(|u| u.cost)
@@ -193,6 +206,20 @@ fn effort_label(effort: &Effort, width: usize) -> String {
     }
 }
 
+/// Color for the context-fill indicator based on how full the window is.
+fn context_usage_color(ratio: f64, active: bool) -> Color {
+    if !active {
+        return Color::DarkGray;
+    }
+    if ratio >= 0.85 {
+        Color::LightRed
+    } else if ratio >= 0.70 {
+        Color::Yellow
+    } else {
+        Color::DarkGray
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use nu_ansi_term::Style;
@@ -207,6 +234,7 @@ mod tests {
                 usage: None,
                 agent_id: AgentId::default(),
                 model: None,
+                context_length: None,
                 reasoning_effort: None,
                 git_branch: None,
             }
@@ -270,7 +298,7 @@ mod tests {
         let _ = prompt.model(ModelId::new("gpt-4"));
 
         let actual = prompt.render_prompt_right();
-        assert!(actual.contains("CODING"));
+        assert!(actual.contains("CODE"));
         assert!(actual.contains("gpt-4"));
         assert!(!actual.contains("1k") && !actual.contains("~"));
     }
@@ -288,7 +316,7 @@ mod tests {
 
         let actual = prompt.render_prompt_right();
         assert!(actual.contains("~30"));
-        assert!(actual.contains("CODING"));
+        assert!(actual.contains("CODE"));
     }
 
     #[test]
@@ -364,6 +392,42 @@ mod tests {
         let actual = prompt.render_prompt_right();
         assert!(actual.contains("0.01"));
         assert!(actual.contains("1.5k"));
+    }
+
+    #[test]
+    fn test_render_prompt_right_with_context_usage() {
+        let usage = Usage {
+            total_tokens: furcode_api::TokenCount::Actual(832),
+            ..Default::default()
+        };
+        let mut prompt = FurcodePrompt::default();
+        let _ = prompt.usage(usage);
+        let _ = prompt.context_length(128_000_u64);
+
+        let actual = prompt.render_prompt_right();
+        // Strip ANSI for assertion.
+        let plain: String = actual
+            .chars()
+            .filter(|c| !c.is_control() && *c != '\u{1b}')
+            .collect();
+        // May still contain escape residues; check for the percent substring.
+        assert!(
+            actual.contains("0.65%") || plain.contains("0.65%"),
+            "expected 0.65% in right prompt, got {actual:?}"
+        );
+    }
+
+    #[test]
+    fn test_render_prompt_right_hides_context_usage_without_limit() {
+        let usage = Usage {
+            total_tokens: furcode_api::TokenCount::Actual(832),
+            ..Default::default()
+        };
+        let mut prompt = FurcodePrompt::default();
+        let _ = prompt.usage(usage);
+
+        let actual = prompt.render_prompt_right();
+        assert!(!actual.contains('%'));
     }
 
     #[test]

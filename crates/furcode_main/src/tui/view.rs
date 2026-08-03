@@ -329,6 +329,11 @@ pub struct SelectablePaint {
 pub struct TurnView {
     pub header_left: String,
     pub header_right: String,
+    /// Compact context-window fill for chrome (e.g. `░0.65%`). Shown in the
+    /// footer (right) so it stays visible next to the composer.
+    pub context_usage: Option<String>,
+    /// 0.0..=1.0 when `context_usage` is set — drives indicator color.
+    pub context_usage_ratio: Option<f64>,
     pub transcript: Vec<TranscriptLine>,
     pub activity: ActivityPhase,
     pub composer: ComposerState,
@@ -510,6 +515,8 @@ impl Default for TurnView {
         Self {
             header_left: " 🄵 ".into(),
             header_right: String::new(),
+            context_usage: None,
+            context_usage_ratio: None,
             transcript: Vec::new(),
             activity: ActivityPhase::Idle,
             composer: ComposerState::default(),
@@ -574,6 +581,11 @@ impl TurnView {
         self.status_tone = StatusTone::Loading;
         self.status_is_error = false;
         self.toast = None;
+        // Fresh session: keep window limit, reset fill to empty if known.
+        if self.context_usage.is_some() {
+            self.context_usage = Some("░0.00%".into());
+            self.context_usage_ratio = Some(0.0);
+        }
         self.composer.clear();
         self.touch_transcript();
     }

@@ -50,7 +50,7 @@ use crate::sync_display::SyncProgressDisplay;
 use crate::title_display::TitleDisplayExt;
 use crate::tools_display::format_tools;
 use crate::update::on_update;
-use crate::utils::humanize_time;
+use crate::utils::{format_context_usage, humanize_time};
 use crate::{TRACKER, banner, tracker};
 
 // File-specific constants
@@ -230,6 +230,122 @@ impl<A: API + ConsoleWriter + 'static, F: Fn(FurcodeConfig) -> A + Send + Sync> 
             Some(agent_id) => self.api.get_agent_model(agent_id).await,
             None => self.api.get_session_config().await.map(|c| c.model),
         }
+    }
+
+    /// Resolves and caches the active model's context window length.
+    ///
+    /// Reuses the cache when the model has not changed so header refreshes
+    /// do not hit the provider models list every turn. Falls back to 128K
+    /// (same default as compaction) when metadata is unavailable so the
+    /// context-% chrome still renders.
+    async fn ensure_context_length(&mut self) -> u64 {
+        const DEFAULT_CONTEXT_WINDOW: u64 = 128_000;
+
+        let Some(model_id) = self.get_agent_model(None).await else {
+            return self.state.context_length.unwrap_or(DEFAULT_CONTEXT_WINDOW);
+        };
+
+        if self.state.context_length_model.as_ref() == Some(&model_id)
+            && let Some(len) = self.state.context_length
+        {
+            return len;
+        }
+
+        let length = match self.api.get_models().await {
+            Ok(models) => {
+                let model_str = model_id.as_str();
+                let short = model_str.rsplit('/').next().unwrap_or(model_str);
+                models
+                    .into_iter()
+                    .find(|m| {
+                        let id = m.id.as_str();
+                        id == model_str
+                            || id == short
+                            || id.rsplit('/').next() == Some(short)
+                            || id.ends_with(model_str)
+                            || model_str.ends_with(id)
+                    })
+                    .and_then(|m| m.context_length)
+            }
+            Err(err) => {
+                tracing::debug!(error = ?err, "failed to resolve model context length");
+                None
+            }
+        };
+
+        let length = length.unwrap_or(DEFAULT_CONTEXT_WINDOW);
+        self.state.context_length = Some(length);
+        self.state.context_length_model = Some(model_id);
+        length
+    }
+
+    /// Current conversation token count used for context-window fill display.
+    ///
+    /// Prefers last-message usage, then falls back to approximate context
+    /// token count so the indicator is not blank mid-session.
+    async fn current_context_tokens(&self) -> usize {
+        let Some(conversation_id) = self.state.conversation_id.as_ref() else {
+            return 0;
+        };
+        let Some(conv) = self
+            .api
+            .conversation(conversation_id)
+            .await
+            .ok()
+            .flatten()
+        else {
+            return 0;
+        };
+
+        if let Some(usage) = conv.usage() {
+            let total = *usage.total_tokens;
+            if total > 0 {
+                return total;
+            }
+            let prompt = *usage.prompt_tokens;
+            if prompt > 0 {
+                return prompt;
+            }
+        }
+
+        conv.token_count().map(|t| *t).unwrap_or(0)
+    }
+
+    /// Builds the TUI header right side: `AGENT  model` (context % lives in footer).
+    async fn build_frame_header_right(&mut self) -> String {
+        let agent = self
+            .api
+            .get_active_agent()
+            .await
+            .map(|a| a.to_string());
+        let model = self
+            .get_agent_model(None)
+            .await
+            .map(|m| m.to_string())
+            .unwrap_or_default();
+        let short_model = model
+            .rsplit('/')
+            .next()
+            .unwrap_or(model.as_str())
+            .to_string();
+
+        // Put raw agent id in the header; `agent_display` shortens to CODE/PLAN/RESEARCH.
+        match agent.as_deref() {
+            Some(a) if !a.is_empty() => format!("{a}  {short_model}"),
+            _ => short_model,
+        }
+    }
+
+    /// Computes context fill for the footer indicator.
+    async fn build_context_usage(&mut self) -> (Option<String>, Option<f64>) {
+        let limit = self.ensure_context_length().await;
+        let used = self.current_context_tokens().await;
+        let ratio = if limit == 0 {
+            0.0
+        } else {
+            (used as f64 / limit as f64).clamp(0.0, 1.0)
+        };
+        (format_context_usage(used, limit), Some(ratio))
     }
 
     fn select_raw_row(
@@ -507,38 +623,17 @@ impl<A: API + ConsoleWriter + 'static, F: Fn(FurcodeConfig) -> A + Send + Sync> 
             .and_then(|n| n.to_str())
             .unwrap_or("furcode");
         let header_left = format!(" 🄵  {cwd}");
-        let agent = self
-            .api
-            .get_active_agent()
-            .await
-            .map(|a| a.to_string());
-        let model = self
-            .get_agent_model(None)
-            .await
-            .map(|m| m.to_string())
-            .unwrap_or_default();
-        let header_right = if let Some(a) = agent {
-            if a.is_empty() {
-                model
-            } else {
-                let display = match a.as_str() {
-                    "coding" => "CODING",
-                    "planning" => "PLANNING",
-                    "researching" => "RESEARCHING",
-                    other => other,
-                };
-                format!("{display}  {model}")
-            }
-        } else {
-            model
-        };
+        let header_right = self.build_frame_header_right().await;
+        let (context_usage, context_usage_ratio) = self.build_context_usage().await;
 
         let mut session = start_session(header_left, header_right)?;
-        // Populate slash-command catalog for the `/` picker.
+        // Populate slash-command catalog + context-% for the `/` picker / footer.
         {
             let catalog = self.tui_command_catalog();
             let mut v = session.view.lock().unwrap_or_else(|e| e.into_inner());
             v.set_command_catalog(catalog);
+            v.context_usage = context_usage;
+            v.context_usage_ratio = context_usage_ratio;
         }
 
         // Dual-tier resume via **raw context JSON** (never full Conversation decode —
@@ -571,13 +666,17 @@ impl<A: API + ConsoleWriter + 'static, F: Fn(FurcodeConfig) -> A + Send + Sync> 
                     tokio::task::yield_now().await;
                     let boot = bootstrap_from_context_json(&json, &env);
                     drop(json);
-                    let mut v = session.view.lock().unwrap_or_else(|e| e.into_inner());
-                    v.history_archive = Some(boot.archive);
-                    if !boot.visible.is_empty() {
-                        v.extend_transcript(boot.visible);
-                        v.scroll_to_bottom();
+                    {
+                        let mut v = session.view.lock().unwrap_or_else(|e| e.into_inner());
+                        v.history_archive = Some(boot.archive);
+                        if !boot.visible.is_empty() {
+                            v.extend_transcript(boot.visible);
+                            v.scroll_to_bottom();
+                        }
+                        v.clear_status();
                     }
-                    v.clear_status();
+                    // Recompute context-% now that conversation tokens are loadable.
+                    self.frame_tui_refresh_header(&session).await;
                 }
                 Ok(Ok(None)) => {
                     tracing::debug!(%id, "no context JSON for conversation");
@@ -700,6 +799,7 @@ impl<A: API + ConsoleWriter + 'static, F: Fn(FurcodeConfig) -> A + Send + Sync> 
                                 session
                                     .interrupt
                                     .store(false, std::sync::atomic::Ordering::SeqCst);
+                                self.frame_tui_refresh_header(&session).await;
                             }
                             FrameStreamOutcome::Quit => {
                                 let _ = join_session(session).await;
@@ -733,6 +833,8 @@ impl<A: API + ConsoleWriter + 'static, F: Fn(FurcodeConfig) -> A + Send + Sync> 
                     session
                         .interrupt
                         .store(false, std::sync::atomic::Ordering::SeqCst);
+                    // Refresh context-% after the turn (usage is now on the last message).
+                    self.frame_tui_refresh_header(&session).await;
                 }
                 FrameStreamOutcome::Quit => {
                     let _ = join_session(session).await;
@@ -790,35 +892,14 @@ impl<A: API + ConsoleWriter + 'static, F: Fn(FurcodeConfig) -> A + Send + Sync> 
             .collect()
     }
 
-    /// Refresh header agent/model after a slash command that may change them.
-    async fn frame_tui_refresh_header(&self, session: &crate::tui::TuiSession) {
-        let agent = self
-            .api
-            .get_active_agent()
-            .await
-            .map(|a| a.to_string());
-        let model = self
-            .get_agent_model(None)
-            .await
-            .map(|m| m.to_string())
-            .unwrap_or_default();
-        let header_right = if let Some(a) = agent {
-            if a.is_empty() {
-                model
-            } else {
-                let display = match a.as_str() {
-                    "coding" => "CODING",
-                    "planning" => "PLANNING",
-                    "researching" => "RESEARCHING",
-                    other => other,
-                };
-                format!("{display}  {model}")
-            }
-        } else {
-            model
-        };
+    /// Refresh header agent/model and footer context-% after a slash command or turn.
+    async fn frame_tui_refresh_header(&mut self, session: &crate::tui::TuiSession) {
+        let header_right = self.build_frame_header_right().await;
+        let (context_usage, context_usage_ratio) = self.build_context_usage().await;
         let mut v = session.view.lock().unwrap_or_else(|e| e.into_inner());
         v.header_right = header_right;
+        v.context_usage = context_usage;
+        v.context_usage_ratio = context_usage_ratio;
         v.touch_transcript();
     }
 
@@ -1154,6 +1235,7 @@ impl<A: API + ConsoleWriter + 'static, F: Fn(FurcodeConfig) -> A + Send + Sync> 
         if let Some(m) = model {
             furcode_prompt.model(m);
         }
+        furcode_prompt.context_length(self.ensure_context_length().await);
         if let Some(e) = reasoning_effort {
             furcode_prompt.reasoning_effort(e);
         }
