@@ -18,7 +18,7 @@ crossterm = "0.29.0"
 ratatui.workspace = true
 unicode-width.workspace = true
 # Terminal markdown renderer for the frame TUI (AGPL-3.0 — keep isolated to TUI path).
-md-tui = { version = "0.10.3", default-features = false, features = ["tree-sitter"] }
+md-tui = { version = "0.11.0", default-features = false, features = ["tree-sitter"] }
 furcode_app.workspace = true
 furcode_api.workspace = true
 furcode_domain.workspace = true
